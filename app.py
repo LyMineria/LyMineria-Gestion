@@ -1,4 +1,7 @@
 # -*- coding: utf-8 -*-
+import hmac
+import os
+
 import streamlit as st
 import pandas as pd
 import psycopg2
@@ -8,22 +11,90 @@ from datetime import datetime
 # CONEXIÓN A POSTGRESQL
 # ------------------------------------------------------------------
 def obtener_conexion():
-    # 1. Conexión a la base de datos en la Nube (Supabase)
-    conn = psycopg2.connect(
-        host="db.kopkotyrjtyvgqewdujh.supabase.co",
-        database="postgres",
-        user="postgres",
-        password="Brianpeirano1996",
-        port="5432"
-    )
-    
-    # 2. Forzamos la compatibilidad con acentos y letras especiales
+    """Abre una conexión usando secretos fuera del código fuente."""
+    try:
+        database_config = st.secrets.get("database", {})
+    except Exception:
+        database_config = {}
+    connection_values = {
+        "host": database_config.get("host", os.getenv("DB_HOST")),
+        "database": database_config.get("database", os.getenv("DB_NAME", "postgres")),
+        "user": database_config.get("user", os.getenv("DB_USER")),
+        "password": database_config.get("password", os.getenv("DB_PASSWORD")),
+        "port": database_config.get("port", os.getenv("DB_PORT", "5432")),
+    }
+    missing_values = [
+        key for key in ("host", "user", "password")
+        if not connection_values[key]
+    ]
+    if missing_values:
+        raise RuntimeError(
+            "Faltan credenciales de base de datos: " + ", ".join(missing_values)
+        )
+
+    conn = psycopg2.connect(**connection_values)
     conn.set_client_encoding('UTF8')
-    
     return conn
 
+
+def cerrar_sesion():
+    st.session_state.pop("usuario_actual", None)
+    st.session_state.pop("rol_usuario", None)
+    st.rerun()
+
+
 st.set_page_config(page_title="Gestión Logística y Minería", layout="wide")
+
+# ------------------------------------------------------------------
+# CONTROL DE ACCESO (LOGIN)
+# ------------------------------------------------------------------
+if 'usuario_actual' not in st.session_state:
+    st.session_state.usuario_actual = None
+
+if st.session_state.usuario_actual is None:
+    st.subheader("🔒 Acceso Restringido - Sistema de Logística y Minería")
+    user = st.text_input("Usuario")
+    password = st.text_input("Contraseña", type="password")
+    
+    if st.button("Ingresar"):
+        conn = None
+        try:
+            conn = obtener_conexion()
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT rol, password FROM usuarios WHERE nombre_usuario = %s",
+                (user,),
+            )
+            res = cur.fetchone()
+            credenciales_validas = bool(
+                res and hmac.compare_digest(str(res[1]), password)
+            )
+
+            if credenciales_validas:
+                st.session_state.usuario_actual = user
+                st.session_state.rol_usuario = res[0]
+                st.success("¡Bienvenido!")
+                st.rerun()
+            else:
+                st.error("Usuario o contraseña incorrectos.")
+        except Exception as e:
+            st.error(f"Error de conexión: {e}")
+        finally:
+            if conn is not None:
+                conn.close()
+            
+    st.stop() # Frena la app acá para que no se muestre nada del sistema de fondo
+
+# ------------------------------------------------------------------
+# INICIO DEL SISTEMA (Solo visible tras iniciar sesión)
+# ------------------------------------------------------------------
 st.title("🚛 Sistema de gestión Logística y Minería")
+header_col, logout_col = st.columns([6, 1])
+with header_col:
+    st.write(f"👤 Usuario conectado: **{st.session_state.usuario_actual}** ({st.session_state.rol_usuario})")
+with logout_col:
+    if st.button("Cerrar sesión"):
+        cerrar_sesion()
 
 tab_remitos, tab_flota, tab_reportes = st.tabs(
     ["📥 Remitos", "🚛 Flota", "📊 Reportes de Toneladas"]
