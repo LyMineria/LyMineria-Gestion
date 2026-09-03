@@ -4,16 +4,15 @@ import pandas as pd
 import psycopg2
 
 def obtener_conexion():
-    # Conectamos el "motor" (Supabase) directo. NO TOCAR.
-    conn = psycopg2.connect(
-        host="db.kopkotyrjtyvgqewdujh.supabase.co",
-        database="postgres",
-        user="postgres",
-        password="Brianpeirano1996",
-        port="5432"
-    )
-    conn.set_client_encoding('UTF8')
-    return conn
+    conn = psycopg2.connect(
+        host="kopkotyrjtyvgqewdujh", # <-- Pegalo acá
+        database="postgres",
+        user="postgres",
+        password="Brianpeirano1996",
+        port="5432"
+    )
+    conn.set_client_encoding('UTF8')
+    return conn
 
 def cerrar_sesion():
     st.session_state.usuario_actual = None
