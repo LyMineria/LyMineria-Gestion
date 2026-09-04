@@ -55,6 +55,15 @@ def preparar_tabla_remitos(connection):
     connection.commit()
 
 
+def preparar_tabla_usuarios(connection):
+    """Deja espacio suficiente para hashes de contraseñas."""
+    with connection.cursor() as cursor:
+        cursor.execute(
+            "ALTER TABLE usuarios ALTER COLUMN password TYPE VARCHAR(255)"
+        )
+    connection.commit()
+
+
 def cerrar_sesion():
     st.session_state.pop("usuario_actual", None)
     st.session_state.pop("rol_usuario", None)
@@ -311,6 +320,15 @@ st.set_page_config(page_title="Gestión Logística y Minería", layout="wide")
 if "usuario_actual" not in st.session_state:
     st.session_state.usuario_actual = None
     st.session_state.rol_usuario = None
+
+try:
+    connection = obtener_conexion()
+    preparar_tabla_usuarios(connection)
+    connection.close()
+except Exception as error:
+    st.error("No se pudo preparar la tabla de usuarios.")
+    st.caption(f"Detalle técnico: {error}")
+    st.stop()
 
 if st.session_state.usuario_actual is None:
     mostrar_login()
