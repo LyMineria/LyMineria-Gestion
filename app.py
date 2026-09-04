@@ -36,7 +36,7 @@ def obtener_conexion():
 
 
 def preparar_tabla_remitos(connection):
-    """Usa una tabla compartida por la carga manual y el futuro lector IA."""
+    """Crea o completa la tabla compartida por carga manual y futuro lector IA."""
     with connection.cursor() as cursor:
         cursor.execute(
             """
@@ -52,6 +52,21 @@ def preparar_tabla_remitos(connection):
                 creado_en TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 actualizado_en TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
+            """
+        )
+        cursor.execute(
+            """
+            ALTER TABLE remitos
+                ADD COLUMN IF NOT EXISTS id BIGSERIAL,
+                ADD COLUMN IF NOT EXISTS fecha DATE,
+                ADD COLUMN IF NOT EXISTS chofer VARCHAR(150),
+                ADD COLUMN IF NOT EXISTS toneladas NUMERIC(12, 3),
+                ADD COLUMN IF NOT EXISTS material VARCHAR(200),
+                ADD COLUMN IF NOT EXISTS tarifa NUMERIC(14, 2),
+                ADD COLUMN IF NOT EXISTS subtotal NUMERIC(16, 2),
+                ADD COLUMN IF NOT EXISTS creado_por VARCHAR(150),
+                ADD COLUMN IF NOT EXISTS creado_en TIMESTAMPTZ DEFAULT NOW(),
+                ADD COLUMN IF NOT EXISTS actualizado_en TIMESTAMPTZ DEFAULT NOW()
             """
         )
     connection.commit()
@@ -108,6 +123,43 @@ def preparar_tablas_flota(connection):
             );
             """
         )
+        cursor.execute(
+            """
+            ALTER TABLE choferes
+                ADD COLUMN IF NOT EXISTS id BIGSERIAL,
+                ADD COLUMN IF NOT EXISTS nombre VARCHAR(100),
+                ADD COLUMN IF NOT EXISTS apellido VARCHAR(100),
+                ADD COLUMN IF NOT EXISTS dni VARCHAR(30),
+                ADD COLUMN IF NOT EXISTS nro_licencia VARCHAR(50),
+                ADD COLUMN IF NOT EXISTS estado VARCHAR(20),
+                ADD COLUMN IF NOT EXISTS vencimiento_licencia DATE,
+                ADD COLUMN IF NOT EXISTS preocupacional DATE,
+                ADD COLUMN IF NOT EXISTS cuil VARCHAR(30),
+                ADD COLUMN IF NOT EXISTS curso_manejo DATE,
+                ADD COLUMN IF NOT EXISTS creado_en TIMESTAMPTZ DEFAULT NOW();
+            ALTER TABLE bateas
+                ADD COLUMN IF NOT EXISTS id BIGSERIAL,
+                ADD COLUMN IF NOT EXISTS patente VARCHAR(20),
+                ADD COLUMN IF NOT EXISTS capacidad NUMERIC(12, 3),
+                ADD COLUMN IF NOT EXISTS tipo VARCHAR(100),
+                ADD COLUMN IF NOT EXISTS marca VARCHAR(100),
+                ADD COLUMN IF NOT EXISTS seguro VARCHAR(150),
+                ADD COLUMN IF NOT EXISTS modelo INTEGER,
+                ADD COLUMN IF NOT EXISTS service DATE,
+                ADD COLUMN IF NOT EXISTS creado_en TIMESTAMPTZ DEFAULT NOW();
+            ALTER TABLE camiones
+                ADD COLUMN IF NOT EXISTS id BIGSERIAL,
+                ADD COLUMN IF NOT EXISTS itv DATE,
+                ADD COLUMN IF NOT EXISTS service DATE,
+                ADD COLUMN IF NOT EXISTS patente VARCHAR(20),
+                ADD COLUMN IF NOT EXISTS marca VARCHAR(100),
+                ADD COLUMN IF NOT EXISTS estado VARCHAR(20),
+                ADD COLUMN IF NOT EXISTS kilometraje NUMERIC(12, 2),
+                ADD COLUMN IF NOT EXISTS control_periodico DATE,
+                ADD COLUMN IF NOT EXISTS seguro VARCHAR(150),
+                ADD COLUMN IF NOT EXISTS creado_en TIMESTAMPTZ DEFAULT NOW();
+            """
+        )
     connection.commit()
 
 
@@ -117,9 +169,38 @@ def cerrar_sesion():
     st.rerun()
 
 
-def mostrar_error(accion):
+def registrar_error(accion, detalle):
+    errores = st.session_state.setdefault("errores_app", [])
+    errores.insert(
+        0,
+        {
+            "momento": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "accion": accion,
+            "detalle": str(detalle).splitlines()[0],
+        },
+    )
+    del errores[20:]
+
+
+def mostrar_error(accion, detalle=None):
+    if detalle is not None:
+        registrar_error(accion, detalle)
     st.error(f"No se pudo {accion}.")
     st.caption("Revisá los Secrets de Streamlit y la disponibilidad de Supabase.")
+
+
+def mostrar_panel_errores():
+    errores = st.session_state.get("errores_app", [])
+    st.subheader("Reporte de errores")
+    if not errores:
+        st.success("No hay errores registrados en esta sesión.")
+        return
+    if st.button("Limpiar reporte de errores", key="limpiar_errores"):
+        st.session_state.errores_app = []
+        st.rerun()
+    for error in errores:
+        st.error(f"{error['momento']} | {error['accion']}")
+        st.code(error["detalle"])
 
 
 def generar_hash_password(password):
@@ -208,7 +289,7 @@ def mostrar_formulario_flota(tipo):
             vencimiento = st.date_input("Vencimiento licencia", value=date.today())
             preocupacional = st.date_input("Preocupacional", value=date.today())
             cuil = st.text_input("CUIL")
-            curso = st.text_input("Curso de manejo")
+            curso = st.date_input("Curso de manejo", value=date.today())
         elif tipo == "Batea":
             patente = st.text_input("Patente")
             capacidad = st.number_input("Capacidad (toneladas)", min_value=0.0, step=0.001)
@@ -248,7 +329,7 @@ def mostrar_formulario_flota(tipo):
                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                     """,
                     (nombre.strip(), apellido.strip(), dni.strip(), licencia.strip(),
-                     estado, vencimiento, preocupacional, cuil.strip(), curso.strip()),
+                     estado, vencimiento, preocupacional, cuil.strip(), curso),
                 )
             elif tipo == "Batea":
                 if not all([patente.strip(), tipo_batea.strip(), marca.strip()]):
@@ -287,6 +368,7 @@ def mostrar_formulario_flota(tipo):
     except Exception as error:
         st.error(f"No se pudo guardar el {tipo.lower()}.")
         st.code(str(error).splitlines()[0])
+        registrar_error(f"guardar el {tipo.lower()}", error)
 
 
 def formulario_remito(remito=None):
@@ -299,6 +381,7 @@ def formulario_remito(remito=None):
             choferes = cargar_choferes_activos()
         except Exception as error:
             st.error("No se pudieron cargar los choferes activos.")
+            registrar_error("cargar choferes activos", error)
             st.code(str(error).splitlines()[0])
             return
         if choferes.empty:
@@ -408,8 +491,8 @@ def formulario_remito(remito=None):
         st.rerun()
     except ValueError as error:
         st.warning(str(error))
-    except Exception:
-        mostrar_error("guardar el remito")
+    except Exception as error:
+        mostrar_error("guardar el remito", error)
 
 
 def mostrar_login():
@@ -456,12 +539,14 @@ def mostrar_login():
                     st.error("Usuario o contraseña incorrectos.")
             except psycopg2.Error as error:
                 st.error("PostgreSQL rechazó la conexión.")
+                registrar_error("iniciar sesión", error)
                 st.caption(
                     "Revisá host, base, usuario, contraseña y puerto en Secrets."
                 )
                 st.code(str(error).splitlines()[0])
             except Exception as error:
                 st.error("No se pudo iniciar sesión.")
+                registrar_error("iniciar sesión", error)
                 st.caption(f"Detalle técnico: {error}")
 
     with tab_registro:
@@ -512,6 +597,7 @@ try:
     connection.close()
 except Exception as error:
     st.error("No se pudo preparar la tabla de usuarios.")
+    registrar_error("preparar tabla de usuarios", error)
     st.caption(f"Detalle técnico: {error}")
     st.stop()
 
@@ -519,16 +605,25 @@ if st.session_state.usuario_actual is None:
     mostrar_login()
     st.stop()
 
-header_col, logout_col = st.columns([8, 2])
+header_col, help_col, logout_col = st.columns([7, 1, 2])
 with header_col:
     st.title("🚛 Sistema de gestión Logística y Minería")
     st.write(
         f"👤 Usuario: **{st.session_state.usuario_actual}** | "
         f"Rol: {st.session_state.rol_usuario}"
     )
+with help_col:
+    if st.button("?", help="Ver el reporte de errores de esta sesión"):
+        st.session_state.mostrar_errores = not st.session_state.get(
+            "mostrar_errores", False
+        )
 with logout_col:
     if st.button("🚪 Cerrar sesión"):
         cerrar_sesion()
+
+if st.session_state.get("mostrar_errores", False):
+    with st.container(border=True):
+        mostrar_panel_errores()
 
 try:
     connection = obtener_conexion()
@@ -538,6 +633,7 @@ try:
 except Exception as error:
     st.error("No se pudo preparar la base de datos para remitos.")
     st.caption("Verificá que el usuario de Supabase pueda crear las tablas.")
+    registrar_error("preparar tablas de la aplicación", error)
     st.code(str(error).splitlines()[0])
     st.stop()
 
@@ -555,6 +651,7 @@ with tabs[0]:
     except Exception as error:
         st.error("No se pudo cargar los remitos.")
         st.caption("La tabla puede tener una estructura anterior o faltar permisos.")
+        registrar_error("cargar remitos", error)
         st.code(str(error).splitlines()[0])
         remitos = pd.DataFrame()
 
@@ -634,6 +731,7 @@ with tabs[1]:
         st.dataframe(cargar_flota("camiones"), use_container_width=True, hide_index=True)
     except Exception as error:
         st.error("No se pudo cargar la flota.")
+        registrar_error("cargar la flota", error)
         st.code(str(error).splitlines()[0])
 
 with tabs[2]:
@@ -676,5 +774,5 @@ if es_admin_supremo:
                         connection.commit()
                         connection.close()
                         st.rerun()
-        except Exception:
-            mostrar_error("cargar las solicitudes")
+        except Exception as error:
+            mostrar_error("cargar las solicitudes", error)
