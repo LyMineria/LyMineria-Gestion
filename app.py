@@ -9,6 +9,8 @@ import pandas as pd
 import psycopg2
 import streamlit as st
 
+ADMIN_USER = "OcampoElio"
+
 
 def obtener_conexion():
     """Abre PostgreSQL usando únicamente secrets de Streamlit."""
@@ -60,6 +62,51 @@ def preparar_tabla_usuarios(connection):
     with connection.cursor() as cursor:
         cursor.execute(
             "ALTER TABLE usuarios ALTER COLUMN password TYPE VARCHAR(255)"
+        )
+    connection.commit()
+
+
+def preparar_tablas_flota(connection):
+    with connection.cursor() as cursor:
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS choferes (
+                id BIGSERIAL PRIMARY KEY,
+                nombre VARCHAR(100) NOT NULL,
+                apellido VARCHAR(100) NOT NULL,
+                dni VARCHAR(30) NOT NULL,
+                nro_licencia VARCHAR(50) NOT NULL,
+                estado VARCHAR(20) NOT NULL CHECK (estado IN ('Activo', 'Vacaciones', 'Licencia')),
+                vencimiento_licencia DATE,
+                preocupacional DATE,
+                cuil VARCHAR(30),
+                curso_manejo VARCHAR(150),
+                creado_en TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            CREATE TABLE IF NOT EXISTS bateas (
+                id BIGSERIAL PRIMARY KEY,
+                patente VARCHAR(20) NOT NULL,
+                capacidad NUMERIC(12, 3) NOT NULL CHECK (capacidad >= 0),
+                tipo VARCHAR(100) NOT NULL,
+                marca VARCHAR(100) NOT NULL,
+                seguro VARCHAR(150),
+                modelo INTEGER,
+                service DATE,
+                creado_en TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            CREATE TABLE IF NOT EXISTS camiones (
+                id BIGSERIAL PRIMARY KEY,
+                itv DATE,
+                service DATE,
+                patente VARCHAR(20) NOT NULL,
+                marca VARCHAR(100) NOT NULL,
+                estado VARCHAR(20) NOT NULL CHECK (estado IN ('Roto', 'Funcional', 'Pausa')),
+                kilometraje NUMERIC(12, 2) NOT NULL CHECK (kilometraje >= 0),
+                control_periodico DATE,
+                seguro VARCHAR(150),
+                creado_en TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            """
         )
     connection.commit()
 
@@ -125,20 +172,158 @@ def cargar_remitos():
         connection.close()
 
 
+def cargar_choferes_activos():
+    connection = obtener_conexion()
+    try:
+        return pd.read_sql_query(
+            """
+            SELECT id, nombre, apellido, estado
+            FROM choferes
+            WHERE estado = 'Activo'
+            ORDER BY apellido, nombre
+            """,
+            connection,
+        )
+    finally:
+        connection.close()
+
+
+def cargar_flota(tabla):
+    connection = obtener_conexion()
+    try:
+        return pd.read_sql_query(f"SELECT * FROM {tabla} ORDER BY id", connection)
+    finally:
+        connection.close()
+
+
+def mostrar_formulario_flota(tipo):
+    st.subheader(f"Agregar {tipo}")
+    with st.form(f"form_flota_{tipo.lower()}"):
+        if tipo == "Chofer":
+            nombre = st.text_input("Nombre")
+            apellido = st.text_input("Apellido")
+            dni = st.text_input("DNI")
+            licencia = st.text_input("Nro. licencia")
+            estado = st.selectbox("Estado", ["Activo", "Vacaciones", "Licencia"])
+            vencimiento = st.date_input("Vencimiento licencia", value=date.today())
+            preocupacional = st.date_input("Preocupacional", value=date.today())
+            cuil = st.text_input("CUIL")
+            curso = st.text_input("Curso de manejo")
+        elif tipo == "Batea":
+            patente = st.text_input("Patente")
+            capacidad = st.number_input("Capacidad (toneladas)", min_value=0.0, step=0.001)
+            tipo_batea = st.text_input("Tipo")
+            marca = st.text_input("Marca")
+            seguro = st.text_input("Seguro")
+            modelo = st.number_input("Modelo (año)", min_value=1900, max_value=2100, value=2026)
+            service = st.date_input("Service", value=date.today())
+        else:
+            itv = st.date_input("ITV", value=date.today())
+            service = st.date_input("Service", value=date.today())
+            patente = st.text_input("Patente")
+            marca = st.text_input("Marca")
+            estado = st.selectbox("Estado", ["Roto", "Funcional", "Pausa"])
+            kilometraje = st.number_input("Kilometraje", min_value=0.0, step=1.0)
+            control = st.date_input("Control periódico", value=date.today())
+            seguro = st.text_input("Seguro")
+
+        guardar = st.form_submit_button("Guardar recurso", type="primary")
+
+    if not guardar:
+        return
+
+    try:
+        connection = obtener_conexion()
+        with connection.cursor() as cursor:
+            if tipo == "Chofer":
+                if not all([nombre.strip(), apellido.strip(), dni.strip(), licencia.strip()]):
+                    st.warning("Completá nombre, apellido, DNI y licencia.")
+                    connection.close()
+                    return
+                cursor.execute(
+                    """
+                    INSERT INTO choferes
+                    (nombre, apellido, dni, nro_licencia, estado,
+                     vencimiento_licencia, preocupacional, cuil, curso_manejo)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (nombre.strip(), apellido.strip(), dni.strip(), licencia.strip(),
+                     estado, vencimiento, preocupacional, cuil.strip(), curso.strip()),
+                )
+            elif tipo == "Batea":
+                if not all([patente.strip(), tipo_batea.strip(), marca.strip()]):
+                    st.warning("Completá patente, tipo y marca.")
+                    connection.close()
+                    return
+                cursor.execute(
+                    """
+                    INSERT INTO bateas
+                    (patente, capacidad, tipo, marca, seguro, modelo, service)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (patente.strip(), capacidad, tipo_batea.strip(), marca.strip(),
+                     seguro.strip(), modelo, service),
+                )
+            else:
+                if not all([patente.strip(), marca.strip()]):
+                    st.warning("Completá patente y marca.")
+                    connection.close()
+                    return
+                cursor.execute(
+                    """
+                    INSERT INTO camiones
+                    (itv, service, patente, marca, estado, kilometraje,
+                     control_periodico, seguro)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (itv, service, patente.strip(), marca.strip(), estado,
+                     kilometraje, control, seguro.strip()),
+                )
+        connection.commit()
+        connection.close()
+        st.session_state.mostrar_formulario_flota = False
+        st.success(f"{tipo} guardado correctamente.")
+        st.rerun()
+    except Exception as error:
+        st.error(f"No se pudo guardar el {tipo.lower()}.")
+        st.code(str(error).splitlines()[0])
+
+
 def formulario_remito(remito=None):
     editando = remito is not None
     identificador = str(remito["id"]) if editando else "nuevo"
     st.subheader("Editar remito" if editando else "Cargar remito manual")
 
     with st.form(f"form_remito_{identificador}"):
+        try:
+            choferes = cargar_choferes_activos()
+        except Exception as error:
+            st.error("No se pudieron cargar los choferes activos.")
+            st.code(str(error).splitlines()[0])
+            return
+        if choferes.empty:
+            st.warning("Primero cargá un chofer con estado Activo en Flota.")
+            return
+        choferes["etiqueta"] = choferes.apply(
+            lambda row: f"{row['nombre']} {row['apellido']} (ID {row['id']})",
+            axis=1,
+        )
+        opciones_chofer = choferes["etiqueta"].tolist()
+        chofer_actual = str(remito["chofer"]) if editando else ""
+        indice_chofer = next(
+            (
+                index
+                for index, etiqueta in enumerate(opciones_chofer)
+                if etiqueta.startswith(chofer_actual + " ")
+            ),
+            0,
+        )
+        chofer = st.selectbox("Chofer", opciones_chofer, index=indice_chofer)
         fecha = st.date_input(
             "Fecha",
             value=pd.to_datetime(remito["fecha"]).date()
             if editando
             else date.today(),
-        )
-        chofer = st.text_input(
-            "Chofer", value=str(remito["chofer"]) if editando else ""
         )
         toneladas = st.number_input(
             "Toneladas",
@@ -348,14 +533,17 @@ with logout_col:
 try:
     connection = obtener_conexion()
     preparar_tabla_remitos(connection)
+    preparar_tablas_flota(connection)
     connection.close()
-except Exception:
+except Exception as error:
     st.error("No se pudo preparar la base de datos para remitos.")
-    st.caption("Verificá que el usuario de Supabase pueda crear la tabla remitos.")
+    st.caption("Verificá que el usuario de Supabase pueda crear las tablas.")
+    st.code(str(error).splitlines()[0])
     st.stop()
 
 pestanas = ["📥 Remitos", "🚛 Flota", "📊 Reportes", "📷 Escáner IA"]
-if st.session_state.rol_usuario == "Admin":
+es_admin_supremo = st.session_state.usuario_actual == ADMIN_USER
+if es_admin_supremo:
     pestanas.append("👥 Aprobar Usuarios")
 tabs = st.tabs(pestanas)
 
@@ -364,8 +552,10 @@ with tabs[0]:
     st.caption("Carga manual y consulta de todos los remitos guardados.")
     try:
         remitos = cargar_remitos()
-    except Exception:
-        mostrar_error("cargar los remitos")
+    except Exception as error:
+        st.error("No se pudo cargar los remitos.")
+        st.caption("La tabla puede tener una estructura anterior o faltar permisos.")
+        st.code(str(error).splitlines()[0])
         remitos = pd.DataFrame()
 
     opciones = {"Nuevo remito": None}
@@ -420,8 +610,31 @@ with tabs[0]:
         )
 
 with tabs[1]:
-    st.header("Flota")
-    st.info("Esta sección queda preparada para la gestión de vehículos.")
+    titulo_col, boton_col = st.columns([8, 2])
+    with titulo_col:
+        st.header("Flota")
+    with boton_col:
+        if st.button("+ Agregar", type="primary"):
+            st.session_state.mostrar_formulario_flota = True
+
+    if st.session_state.get("mostrar_formulario_flota", False):
+        tipo_recurso = st.selectbox(
+            "¿Qué recurso querés agregar?",
+            ["Chofer", "Batea", "Camión"],
+            key="tipo_recurso_flota",
+        )
+        mostrar_formulario_flota(tipo_recurso)
+
+    st.subheader("Choferes")
+    try:
+        st.dataframe(cargar_flota("choferes"), use_container_width=True, hide_index=True)
+        st.subheader("Bateas")
+        st.dataframe(cargar_flota("bateas"), use_container_width=True, hide_index=True)
+        st.subheader("Camiones")
+        st.dataframe(cargar_flota("camiones"), use_container_width=True, hide_index=True)
+    except Exception as error:
+        st.error("No se pudo cargar la flota.")
+        st.code(str(error).splitlines()[0])
 
 with tabs[2]:
     st.header("Reportes")
@@ -431,7 +644,7 @@ with tabs[3]:
     st.header("Escáner IA")
     st.info("Aquí se incorporará la lectura de remitos mediante fotografía.")
 
-if st.session_state.rol_usuario == "Admin":
+if es_admin_supremo:
     with tabs[4]:
         st.header("👥 Solicitudes pendientes")
         try:
