@@ -260,8 +260,15 @@ def mostrar_login():
                     st.error("Tu acceso fue rechazado o deshabilitado.")
                 else:
                     st.error("Usuario o contraseña incorrectos.")
-            except Exception:
-                mostrar_error("iniciar sesión")
+            except psycopg2.Error as error:
+                st.error("PostgreSQL rechazó la conexión.")
+                st.caption(
+                    "Revisá host, base, usuario, contraseña y puerto en Secrets."
+                )
+                st.code(str(error).splitlines()[0])
+            except Exception as error:
+                st.error("No se pudo iniciar sesión.")
+                st.caption(f"Detalle técnico: {error}")
 
     with tab_registro:
         nuevo_user = st.text_input("Elegí un nombre de usuario", key="reg_user")
