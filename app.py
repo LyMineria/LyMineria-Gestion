@@ -36,12 +36,13 @@ def obtener_conexion():
 
 
 def preparar_tabla_remitos(connection):
-    """Crea o completa la tabla compartida por carga manual y futuro lector IA."""
+    """Prepara una tabla propia para evitar conflictos con el esquema legacy."""
     with connection.cursor() as cursor:
         cursor.execute(
             """
-            CREATE TABLE IF NOT EXISTS remitos (
+            CREATE TABLE IF NOT EXISTS remitos_app (
                 id BIGSERIAL PRIMARY KEY,
+                numero_remito BIGSERIAL UNIQUE NOT NULL,
                 fecha DATE NOT NULL,
                 chofer VARCHAR(150) NOT NULL,
                 toneladas NUMERIC(12, 3) NOT NULL CHECK (toneladas >= 0),
@@ -56,8 +57,9 @@ def preparar_tabla_remitos(connection):
         )
         cursor.execute(
             """
-            ALTER TABLE remitos
+            ALTER TABLE remitos_app
                 ADD COLUMN IF NOT EXISTS id BIGSERIAL,
+                ADD COLUMN IF NOT EXISTS numero_remito BIGSERIAL,
                 ADD COLUMN IF NOT EXISTS fecha DATE,
                 ADD COLUMN IF NOT EXISTS chofer VARCHAR(150),
                 ADD COLUMN IF NOT EXISTS toneladas NUMERIC(12, 3),
@@ -207,7 +209,7 @@ def mostrar_error(accion, detalle=None):
     if detalle is not None:
         registrar_error(accion, detalle)
     st.error(f"No se pudo {accion}.")
-    st.caption("Revisá los Secrets de Streamlit y la disponibilidad de Supabase.")
+    st.caption("Abrí el botón ? para consultar el detalle técnico del error.")
 
 
 def mostrar_panel_errores():
@@ -263,9 +265,9 @@ def cargar_remitos():
     try:
         return pd.read_sql_query(
             """
-            SELECT id, fecha, chofer, toneladas, material, tarifa, subtotal,
+                 SELECT id, numero_remito, fecha, chofer, toneladas, material, tarifa, subtotal,
                    creado_por, creado_en
-            FROM remitos
+                 FROM remitos_app
             ORDER BY fecha DESC, id DESC
             """,
             connection,
@@ -661,7 +663,7 @@ def formulario_remito(remito=None):
                 if editando:
                     cursor.execute(
                         """
-                        UPDATE remitos
+                        UPDATE remitos_app
                         SET fecha = %s, chofer = %s, toneladas = %s,
                             material = %s, tarifa = %s, subtotal = %s,
                             actualizado_en = NOW()
@@ -680,7 +682,7 @@ def formulario_remito(remito=None):
                 else:
                     cursor.execute(
                         """
-                        INSERT INTO remitos
+                        INSERT INTO remitos_app
                             (fecha, chofer, toneladas, material, tarifa,
                              subtotal, creado_por)
                         VALUES (%s, %s, %s, %s, %s, %s, %s)
@@ -796,7 +798,34 @@ def mostrar_login():
                     mostrar_error("registrar el usuario")
 
 
-st.set_page_config(page_title="Gestión Logística y Minería", layout="wide")
+st.set_page_config(
+    page_title="Gestión Logística y Minería",
+    page_icon="🚛",
+    layout="wide",
+    initial_sidebar_state="collapsed",
+)
+
+st.markdown(
+    """
+    <style>
+    :root { --ink: #f4f7fb; --muted: #9aa7b8; --line: #263244; --accent: #ff5a52; }
+    .stApp { background: #0b1118; color: var(--ink); }
+    .block-container { max-width: 1280px; padding-top: 2.2rem; padding-bottom: 3rem; }
+    h1 { letter-spacing: -0.02em; font-weight: 750; }
+    h2, h3 { letter-spacing: -0.01em; }
+    [data-testid="stHeader"] { background: transparent; }
+    [data-testid="stMetric"] { background: #131c27; border: 1px solid var(--line); padding: 1rem; border-radius: 12px; }
+    [data-testid="stForm"] { background: #101923; border: 1px solid var(--line); border-radius: 12px; padding: 1.1rem; }
+    [data-testid="stDataFrame"] { border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+    .stButton > button { border-radius: 8px; font-weight: 650; }
+    .stButton > button[kind="primary"] { background: var(--accent); border-color: var(--accent); }
+    div[data-baseweb="tab-list"] { gap: 0.35rem; border-bottom: 1px solid var(--line); }
+    button[data-baseweb="tab"] { color: var(--muted); padding: 0.75rem 0.9rem; }
+    button[data-baseweb="tab"][aria-selected="true"] { color: var(--ink); }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 if "usuario_actual" not in st.session_state:
     st.session_state.usuario_actual = None
@@ -870,7 +899,7 @@ with tabs[0]:
     if not remitos.empty:
         opciones.update(
             {
-                f"#{row.id} | {row.fecha} | {row.chofer} | {row.material}": row.id
+                f"Remito #{row.numero_remito} | {row.fecha} | {row.chofer} | {row.material}": row.id
                 for row in remitos.itertuples()
             }
         )
@@ -891,6 +920,7 @@ with tabs[0]:
         vista = remitos.rename(
             columns={
                 "id": "ID",
+                "numero_remito": "N° Remito",
                 "fecha": "Fecha",
                 "chofer": "Chofer",
                 "toneladas": "Toneladas",
@@ -903,7 +933,7 @@ with tabs[0]:
         st.dataframe(
             vista[
                 [
-                    "ID",
+                    "N° Remito",
                     "Fecha",
                     "Chofer",
                     "Toneladas",
