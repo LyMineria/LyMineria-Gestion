@@ -87,11 +87,12 @@ def preparar_tablas_flota(connection):
             """
             CREATE TABLE IF NOT EXISTS choferes (
                 id BIGSERIAL PRIMARY KEY,
+                nombre_completo VARCHAR(200) NOT NULL,
                 nombre VARCHAR(100) NOT NULL,
                 apellido VARCHAR(100) NOT NULL,
-                dni VARCHAR(30) NOT NULL,
-                nro_licencia VARCHAR(50) NOT NULL,
-                estado VARCHAR(20) NOT NULL CHECK (estado IN ('Activo', 'Vacaciones', 'Licencia')),
+                dni VARCHAR(30),
+                nro_licencia VARCHAR(50),
+                estado VARCHAR(20) DEFAULT 'Activo' CHECK (estado IN ('Activo', 'Vacaciones', 'Licencia')),
                 vencimiento_licencia DATE,
                 preocupacional DATE,
                 cuil VARCHAR(30),
@@ -127,6 +128,7 @@ def preparar_tablas_flota(connection):
             """
             ALTER TABLE choferes
                 ADD COLUMN IF NOT EXISTS id BIGSERIAL,
+                ADD COLUMN IF NOT EXISTS nombre_completo VARCHAR(200),
                 ADD COLUMN IF NOT EXISTS nombre VARCHAR(100),
                 ADD COLUMN IF NOT EXISTS apellido VARCHAR(100),
                 ADD COLUMN IF NOT EXISTS dni VARCHAR(30),
@@ -135,8 +137,15 @@ def preparar_tablas_flota(connection):
                 ADD COLUMN IF NOT EXISTS vencimiento_licencia DATE,
                 ADD COLUMN IF NOT EXISTS preocupacional DATE,
                 ADD COLUMN IF NOT EXISTS cuil VARCHAR(30),
-                ADD COLUMN IF NOT EXISTS curso_manejo DATE,
+                ADD COLUMN IF NOT EXISTS curso_manejo VARCHAR(150),
                 ADD COLUMN IF NOT EXISTS creado_en TIMESTAMPTZ DEFAULT NOW();
+            UPDATE choferes
+            SET nombre_completo = NULLIF(TRIM(COALESCE(nombre, '') || ' ' || COALESCE(apellido, '')), '')
+            WHERE nombre_completo IS NULL;
+            ALTER TABLE choferes ALTER COLUMN nombre_completo DROP NOT NULL;
+            ALTER TABLE choferes ALTER COLUMN dni DROP NOT NULL;
+            ALTER TABLE choferes ALTER COLUMN nro_licencia DROP NOT NULL;
+            ALTER TABLE choferes ALTER COLUMN estado DROP NOT NULL;
             ALTER TABLE bateas
                 ADD COLUMN IF NOT EXISTS id BIGSERIAL,
                 ADD COLUMN IF NOT EXISTS patente VARCHAR(20),
@@ -158,6 +167,14 @@ def preparar_tablas_flota(connection):
                 ADD COLUMN IF NOT EXISTS control_periodico DATE,
                 ADD COLUMN IF NOT EXISTS seguro VARCHAR(150),
                 ADD COLUMN IF NOT EXISTS creado_en TIMESTAMPTZ DEFAULT NOW();
+            CREATE TABLE IF NOT EXISTS asignaciones_flota (
+                id BIGSERIAL PRIMARY KEY,
+                camion_id BIGINT REFERENCES camiones(id) ON DELETE SET NULL,
+                batea_id BIGINT REFERENCES bateas(id) ON DELETE SET NULL,
+                chofer_id BIGINT REFERENCES choferes(id) ON DELETE SET NULL,
+                destino VARCHAR(200),
+                actualizado_en TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
             """
         )
     connection.commit()
@@ -277,6 +294,194 @@ def cargar_flota(tabla):
         connection.close()
 
 
+def editar_recursos_flota(tabla, columnas, etiqueta):
+    connection = obtener_conexion()
+    try:
+        datos = pd.read_sql_query(
+            f"SELECT id, {', '.join(columnas)} FROM {tabla} ORDER BY id",
+            connection,
+        )
+    finally:
+        connection.close()
+    if datos.empty:
+        st.info(f"No hay {etiqueta} cargados.")
+        return
+
+    consulta = st.text_input(
+        f"Buscar {etiqueta[:-1]}", key=f"buscar_{tabla}",
+        placeholder="Escribí nombre, patente, DNI o marca...",
+    ).strip().lower()
+    visibles = datos
+    if consulta:
+        mascara = datos.astype(str).apply(
+            lambda columna: columna.str.lower().str.contains(consulta, na=False)
+        ).any(axis=1)
+        visibles = datos[mascara]
+    if visibles.empty:
+        st.info("No se encontraron recursos con esa búsqueda.")
+        return
+
+    editados = st.data_editor(
+        visibles,
+        key=f"editor_{tabla}",
+        use_container_width=True,
+        hide_index=True,
+        disabled=["id"],
+    )
+    if st.button(f"Guardar cambios de {etiqueta}", key=f"guardar_edicion_{tabla}"):
+        connection = obtener_conexion()
+        try:
+            with connection.cursor() as cursor:
+                assignments = ", ".join(f"{columna} = %s" for columna in columnas)
+                for _, fila in editados.iterrows():
+                    valores = [
+                        None if pd.isna(fila[columna]) else fila[columna]
+                        for columna in columnas
+                    ]
+                    cursor.execute(
+                        f"UPDATE {tabla} SET {assignments} WHERE id = %s",
+                        valores + [int(fila["id"])],
+                    )
+            connection.commit()
+            connection.close()
+            st.success("Cambios guardados.")
+            st.rerun()
+        except Exception as error:
+            connection.rollback()
+            connection.close()
+            mostrar_error(f"guardar cambios de {etiqueta}", error)
+
+
+def mostrar_cuadro_asignaciones():
+    st.subheader("Asignación operativa")
+    st.caption("Elegí qué camion, batea y chofer trabajan juntos y definí el destino.")
+    try:
+        camiones = cargar_flota("camiones")
+        bateas = cargar_flota("bateas")
+        choferes = cargar_flota("choferes")
+        connection = obtener_conexion()
+        asignaciones_guardadas = pd.read_sql_query(
+            "SELECT camion_id, batea_id, chofer_id, destino FROM asignaciones_flota ORDER BY id",
+            connection,
+        )
+        connection.close()
+    except Exception as error:
+        mostrar_error("cargar datos para asignaciones", error)
+        return
+
+    camion_opciones = {"Sin asignar": None}
+    camion_opciones.update(
+        {
+            f"Camión {fila.id} | {fila.patente} | {fila.marca}": int(fila.id)
+            for fila in camiones.itertuples()
+        }
+    )
+    batea_opciones = {"Sin asignar": None}
+    batea_opciones.update(
+        {
+            f"Batea {fila.id} | {fila.patente} | {fila.marca}": int(fila.id)
+            for fila in bateas.itertuples()
+        }
+    )
+    chofer_opciones = {"Sin asignar": None}
+    chofer_opciones.update(
+        {
+            f"Chofer {fila.id} | {fila.nombre} {fila.apellido}": int(fila.id)
+            for fila in choferes.itertuples()
+        }
+    )
+    cantidad_filas = max(len(camiones), len(bateas), len(choferes), 1)
+    with st.form("form_asignaciones"):
+        asignaciones = []
+        for indice in range(cantidad_filas):
+            st.markdown(f"**Unidad {indice + 1}**")
+            col_camion, col_batea, col_chofer, col_destino = st.columns(4)
+            with col_camion:
+                camion_guardado = (
+                    asignaciones_guardadas.iloc[indice]["camion_id"]
+                    if indice < len(asignaciones_guardadas)
+                    else None
+                )
+                camion_index = next(
+                    (pos for pos, valor in enumerate(camion_opciones.values())
+                     if valor == camion_guardado),
+                    0,
+                )
+                camion = st.selectbox(
+                    "Camión", list(camion_opciones), index=camion_index,
+                    key=f"asig_camion_{indice}"
+                )
+            with col_batea:
+                batea_guardada = (
+                    asignaciones_guardadas.iloc[indice]["batea_id"]
+                    if indice < len(asignaciones_guardadas)
+                    else None
+                )
+                batea_index = next(
+                    (pos for pos, valor in enumerate(batea_opciones.values())
+                     if valor == batea_guardada),
+                    0,
+                )
+                batea = st.selectbox(
+                    "Batea", list(batea_opciones), index=batea_index,
+                    key=f"asig_batea_{indice}"
+                )
+            with col_chofer:
+                chofer_guardado = (
+                    asignaciones_guardadas.iloc[indice]["chofer_id"]
+                    if indice < len(asignaciones_guardadas)
+                    else None
+                )
+                chofer_index = next(
+                    (pos for pos, valor in enumerate(chofer_opciones.values())
+                     if valor == chofer_guardado),
+                    0,
+                )
+                chofer = st.selectbox(
+                    "Chofer", list(chofer_opciones), index=chofer_index,
+                    key=f"asig_chofer_{indice}"
+                )
+            with col_destino:
+                destino_guardado = (
+                    asignaciones_guardadas.iloc[indice]["destino"]
+                    if indice < len(asignaciones_guardadas)
+                    else ""
+                )
+                destino = st.text_input(
+                    "Destino", value=destino_guardado or "",
+                    key=f"asig_destino_{indice}"
+                )
+            asignaciones.append(
+                (camion_opciones[camion], batea_opciones[batea],
+                 chofer_opciones[chofer], destino.strip())
+            )
+        guardar = st.form_submit_button("Guardar asignaciones", type="primary")
+
+    if guardar:
+        try:
+            connection = obtener_conexion()
+            with connection.cursor() as cursor:
+                cursor.execute("DELETE FROM asignaciones_flota")
+                for camion_id, batea_id, chofer_id, destino in asignaciones:
+                    if any([camion_id, batea_id, chofer_id, destino]):
+                        cursor.execute(
+                            """
+                            INSERT INTO asignaciones_flota
+                                (camion_id, batea_id, chofer_id, destino)
+                            VALUES (%s, %s, %s, %s)
+                            """,
+                            (camion_id, batea_id, chofer_id, destino or None),
+                        )
+            connection.commit()
+            connection.close()
+            st.success("Asignaciones actualizadas.")
+            st.rerun()
+        except Exception as error:
+            connection.rollback()
+            connection.close()
+            mostrar_error("guardar asignaciones", error)
+
+
 def mostrar_formulario_flota(tipo):
     st.subheader(f"Agregar {tipo}")
     with st.form(f"form_flota_{tipo.lower()}"):
@@ -317,19 +522,21 @@ def mostrar_formulario_flota(tipo):
         connection = obtener_conexion()
         with connection.cursor() as cursor:
             if tipo == "Chofer":
-                if not all([nombre.strip(), apellido.strip(), dni.strip(), licencia.strip()]):
-                    st.warning("Completá nombre, apellido, DNI y licencia.")
+                if not nombre.strip() or not apellido.strip():
+                    st.warning("Completá nombre y apellido.")
                     connection.close()
                     return
                 cursor.execute(
                     """
                     INSERT INTO choferes
-                    (nombre, apellido, dni, nro_licencia, estado,
+                        (nombre_completo, nombre, apellido, dni, nro_licencia, estado,
                      vencimiento_licencia, preocupacional, cuil, curso_manejo)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        VALUES (%s, %s, %s, NULLIF(%s, ''), NULLIF(%s, ''), %s,
+                            %s, %s, NULLIF(%s, ''), %s)
                     """,
-                    (nombre.strip(), apellido.strip(), dni.strip(), licencia.strip(),
-                     estado, vencimiento, preocupacional, cuil.strip(), curso),
+                        (f"{nombre.strip()} {apellido.strip()}", nombre.strip(),
+                         apellido.strip(), dni.strip(), licencia.strip(), estado,
+                         vencimiento, preocupacional, cuil.strip(), curso.isoformat()),
                 )
             elif tipo == "Batea":
                 if not all([patente.strip(), tipo_batea.strip(), marca.strip()]):
@@ -707,9 +914,15 @@ with tabs[0]:
         )
 
 with tabs[1]:
-    titulo_col, boton_col = st.columns([8, 2])
+    titulo_col, buscar_col, boton_col = st.columns([7, 1.5, 1.5])
     with titulo_col:
         st.header("Flota")
+    with buscar_col:
+        if st.button("🔍", help="Buscar y editar un recurso"):
+            st.session_state.mostrar_busqueda_flota = not st.session_state.get(
+                "mostrar_busqueda_flota", False
+            )
+            st.session_state.vista_flota = "Recursos separados"
     with boton_col:
         if st.button("+ Agregar", type="primary"):
             st.session_state.mostrar_formulario_flota = True
@@ -722,17 +935,45 @@ with tabs[1]:
         )
         mostrar_formulario_flota(tipo_recurso)
 
-    st.subheader("Choferes")
-    try:
-        st.dataframe(cargar_flota("choferes"), use_container_width=True, hide_index=True)
+    vista_flota = st.radio(
+        "Vista",
+        ["Cuadro de asignaciones", "Recursos separados"],
+        horizontal=True,
+        key="vista_flota",
+    )
+    if vista_flota == "Cuadro de asignaciones":
+        mostrar_cuadro_asignaciones()
+    else:
+        st.subheader("Choferes")
+        editar_recursos_flota(
+            "choferes",
+            [
+                "nombre_completo", "nombre", "apellido", "dni", "nro_licencia",
+                "estado", "vencimiento_licencia", "preocupacional", "cuil",
+                "curso_manejo",
+            ],
+            "choferes",
+        )
         st.subheader("Bateas")
-        st.dataframe(cargar_flota("bateas"), use_container_width=True, hide_index=True)
+        editar_recursos_flota(
+            "bateas",
+            ["patente", "capacidad", "tipo", "marca", "seguro", "modelo", "service"],
+            "bateas",
+        )
         st.subheader("Camiones")
-        st.dataframe(cargar_flota("camiones"), use_container_width=True, hide_index=True)
-    except Exception as error:
-        st.error("No se pudo cargar la flota.")
-        registrar_error("cargar la flota", error)
-        st.code(str(error).splitlines()[0])
+        editar_recursos_flota(
+            "camiones",
+            [
+                "itv", "service", "patente", "marca", "estado", "kilometraje",
+                "control_periodico", "seguro",
+            ],
+            "camiones",
+        )
+
+    if st.session_state.get("mostrar_busqueda_flota", False):
+        st.divider()
+        st.subheader("Buscar y editar recurso")
+        st.caption("La búsqueda y los editores aparecen en la vista Recursos separados.")
 
 with tabs[2]:
     st.header("Reportes")
