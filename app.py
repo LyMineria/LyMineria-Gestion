@@ -169,12 +169,16 @@ def preparar_tablas_flota(connection):
                 ADD COLUMN IF NOT EXISTS creado_en TIMESTAMPTZ DEFAULT NOW();
             CREATE TABLE IF NOT EXISTS asignaciones_flota (
                 id BIGSERIAL PRIMARY KEY,
-                camion_id BIGINT REFERENCES camiones(id) ON DELETE SET NULL,
-                batea_id BIGINT REFERENCES bateas(id) ON DELETE SET NULL,
-                chofer_id BIGINT REFERENCES choferes(id) ON DELETE SET NULL,
+                camion_id BIGINT,
+                batea_id BIGINT,
+                chofer_id BIGINT,
                 destino VARCHAR(200),
                 actualizado_en TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );
+            ALTER TABLE asignaciones_flota
+                DROP CONSTRAINT IF EXISTS asignaciones_flota_camion_id_fkey,
+                DROP CONSTRAINT IF EXISTS asignaciones_flota_batea_id_fkey,
+                DROP CONSTRAINT IF EXISTS asignaciones_flota_chofer_id_fkey;
             """
         )
     connection.commit()
