@@ -128,7 +128,7 @@ def preparar_tablas_flota(connection):
                 vencimiento_licencia DATE,
                 preocupacional DATE,
                 cuil VARCHAR(30),
-                curso_manejo VARCHAR(150),
+                curso_manejo DATE,
                 creado_en TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );
             CREATE TABLE IF NOT EXISTS bateas (
@@ -137,7 +137,7 @@ def preparar_tablas_flota(connection):
                 capacidad NUMERIC(12, 3) NOT NULL CHECK (capacidad >= 0),
                 tipo VARCHAR(100) NOT NULL,
                 marca VARCHAR(100) NOT NULL,
-                seguro VARCHAR(150),
+                seguro DATE,
                 modelo INTEGER,
                 service DATE,
                 vencimiento_seguro DATE,
@@ -152,7 +152,7 @@ def preparar_tablas_flota(connection):
                 estado VARCHAR(20) NOT NULL CHECK (estado IN ('Roto', 'Funcional', 'Pausa')),
                 kilometraje NUMERIC(12, 2) NOT NULL CHECK (kilometraje >= 0),
                 control_periodico DATE,
-                seguro VARCHAR(150),
+                seguro DATE,
                 creado_en TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );
             """
@@ -170,7 +170,7 @@ def preparar_tablas_flota(connection):
                 ADD COLUMN IF NOT EXISTS vencimiento_licencia DATE,
                 ADD COLUMN IF NOT EXISTS preocupacional DATE,
                 ADD COLUMN IF NOT EXISTS cuil VARCHAR(30),
-                ADD COLUMN IF NOT EXISTS curso_manejo VARCHAR(150),
+                ADD COLUMN IF NOT EXISTS curso_manejo DATE,
                 ADD COLUMN IF NOT EXISTS creado_en TIMESTAMPTZ DEFAULT NOW();
             UPDATE choferes
             SET nombre_completo = NULLIF(TRIM(COALESCE(nombre, '') || ' ' || COALESCE(apellido, '')), '')
@@ -179,17 +179,20 @@ def preparar_tablas_flota(connection):
             ALTER TABLE choferes ALTER COLUMN dni DROP NOT NULL;
             ALTER TABLE choferes ALTER COLUMN nro_licencia DROP NOT NULL;
             ALTER TABLE choferes ALTER COLUMN estado DROP NOT NULL;
+            ALTER TABLE choferes ALTER COLUMN curso_manejo TYPE DATE USING NULLIF(CASE WHEN curso_manejo ~ '^\\d{4}-\\d{2}-\\d{2}$' THEN curso_manejo ELSE NULL END, '')::DATE;
             ALTER TABLE bateas
                 ADD COLUMN IF NOT EXISTS id BIGSERIAL,
                 ADD COLUMN IF NOT EXISTS patente VARCHAR(20),
                 ADD COLUMN IF NOT EXISTS capacidad NUMERIC(12, 3),
                 ADD COLUMN IF NOT EXISTS tipo VARCHAR(100),
                 ADD COLUMN IF NOT EXISTS marca VARCHAR(100),
-                ADD COLUMN IF NOT EXISTS seguro VARCHAR(150),
+                ADD COLUMN IF NOT EXISTS seguro DATE,
                 ADD COLUMN IF NOT EXISTS modelo INTEGER,
                 ADD COLUMN IF NOT EXISTS service DATE,
                 ADD COLUMN IF NOT EXISTS vencimiento_seguro DATE,
                 ADD COLUMN IF NOT EXISTS creado_en TIMESTAMPTZ DEFAULT NOW();
+            ALTER TABLE bateas ALTER COLUMN seguro TYPE DATE USING CASE WHEN seguro ~ '^\\d{4}-\\d{2}-\\d{2}$' THEN seguro::DATE ELSE NULL END;
+            ALTER TABLE bateas ALTER COLUMN vencimiento_seguro TYPE DATE USING CASE WHEN vencimiento_seguro ~ '^\\d{4}-\\d{2}-\\d{2}$' THEN vencimiento_seguro::DATE ELSE NULL END;
             ALTER TABLE camiones
                 ADD COLUMN IF NOT EXISTS id BIGSERIAL,
                 ADD COLUMN IF NOT EXISTS itv DATE,
@@ -199,8 +202,9 @@ def preparar_tablas_flota(connection):
                 ADD COLUMN IF NOT EXISTS estado VARCHAR(20),
                 ADD COLUMN IF NOT EXISTS kilometraje NUMERIC(12, 2),
                 ADD COLUMN IF NOT EXISTS control_periodico DATE,
-                ADD COLUMN IF NOT EXISTS seguro VARCHAR(150),
+                ADD COLUMN IF NOT EXISTS seguro DATE,
                 ADD COLUMN IF NOT EXISTS creado_en TIMESTAMPTZ DEFAULT NOW();
+            ALTER TABLE camiones ALTER COLUMN seguro TYPE DATE USING CASE WHEN seguro ~ '^\\d{4}-\\d{2}-\\d{2}$' THEN seguro::DATE ELSE NULL END;
             CREATE TABLE IF NOT EXISTS asignaciones_flota (
                 id BIGSERIAL PRIMARY KEY,
                 camion_id BIGINT,
@@ -660,11 +664,13 @@ def mostrar_formulario_flota(tipo):
             estado = st.selectbox("Estado", ["Activo", "Vacaciones", "Licencia"])
             vencimiento = st.date_input("Vencimiento licencia", value=date.today())
             preocupacional = st.date_input("Preocupacional", value=date.today())
-            curso = st.text_input(
+            curso = st.date_input(
                 "Curso de manejo",
-                value=str(fila_fuente["curso_manejo"])
-                if fila_fuente is not None and pd.notna(fila_fuente["curso_manejo"])
-                else "",
+                value=(
+                    pd.to_datetime(fila_fuente["curso_manejo"], errors="coerce").date()
+                    if fila_fuente is not None and pd.notna(fila_fuente["curso_manejo"])
+                    else date.today()
+                ),
             )
         elif tipo == "Batea":
             etiquetas = ["Completar manualmente"] + (
@@ -704,7 +710,14 @@ def mostrar_formulario_flota(tipo):
             estado = st.selectbox("Estado", ["Roto", "Funcional", "Pausa"])
             kilometraje = st.number_input("Kilometraje", min_value=0.0, step=1.0)
             control = st.date_input("Control periódico", value=date.today())
-            seguro = st.text_input("Seguro")
+            seguro = st.date_input(
+                "Seguro",
+                value=(
+                    pd.to_datetime(fila_fuente["seguro"], errors="coerce").date()
+                    if fila_fuente is not None and pd.notna(fila_fuente["seguro"])
+                    else date.today()
+                ),
+            )
 
         guardar = st.form_submit_button("Guardar recurso", type="primary")
 
@@ -723,13 +736,21 @@ def mostrar_formulario_flota(tipo):
                     """
                     INSERT INTO choferes
                         (nombre_completo, nombre, apellido, dni, nro_licencia, estado,
-                     vencimiento_licencia, preocupacional, curso_manejo)
+                         vencimiento_licencia, preocupacional, curso_manejo)
                         VALUES (%s, %s, %s, NULLIF(%s, ''), NULLIF(%s, ''), %s,
                             %s, %s, %s)
                     """,
-                        (f"{nombre.strip()} {apellido.strip()}", nombre.strip(),
-                         apellido.strip(), dni.strip(), licencia.strip(), estado,
-                         vencimiento, preocupacional, curso.isoformat()),
+                    (
+                        f"{nombre.strip()} {apellido.strip()}",
+                        nombre.strip(),
+                        apellido.strip(),
+                        dni.strip(),
+                        licencia.strip(),
+                        estado,
+                        vencimiento,
+                        preocupacional,
+                        curso,
+                    ),
                 )
             elif tipo == "Batea":
                 if not all([patente.strip(), tipo_batea.strip(), marca.strip()]):
@@ -758,7 +779,7 @@ def mostrar_formulario_flota(tipo):
                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                     """,
                     (itv, service, patente.strip(), marca.strip(), estado,
-                     kilometraje, control, seguro.strip()),
+                     kilometraje, control, seguro),
                 )
         connection.commit()
         with connection.cursor() as cursor:
