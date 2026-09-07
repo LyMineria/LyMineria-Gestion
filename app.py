@@ -199,7 +199,7 @@ def preparar_tablas_flota(connection):
             ALTER TABLE choferes ALTER COLUMN dni DROP NOT NULL;
             ALTER TABLE choferes ALTER COLUMN nro_licencia DROP NOT NULL;
             ALTER TABLE choferes ALTER COLUMN estado DROP NOT NULL;
-            ALTER TABLE choferes ALTER COLUMN curso_manejo TYPE DATE USING NULLIF(CASE WHEN curso_manejo ~ '^\\d{4}-\\d{2}-\\d{2}$' THEN curso_manejo ELSE NULL END, '')::DATE;
+            ALTER TABLE choferes ALTER COLUMN curso_manejo TYPE DATE USING NULLIF(curso_manejo::text, '')::DATE;
             ALTER TABLE bateas
                 ADD COLUMN IF NOT EXISTS id BIGSERIAL,
                 ADD COLUMN IF NOT EXISTS patente VARCHAR(20),
@@ -211,8 +211,8 @@ def preparar_tablas_flota(connection):
                 ADD COLUMN IF NOT EXISTS service DATE,
                 ADD COLUMN IF NOT EXISTS vencimiento_seguro DATE,
                 ADD COLUMN IF NOT EXISTS creado_en TIMESTAMPTZ DEFAULT NOW();
-            ALTER TABLE bateas ALTER COLUMN seguro TYPE DATE USING CASE WHEN seguro ~ '^\\d{4}-\\d{2}-\\d{2}$' THEN seguro::DATE ELSE NULL END;
-            ALTER TABLE bateas ALTER COLUMN vencimiento_seguro TYPE DATE USING CASE WHEN vencimiento_seguro ~ '^\\d{4}-\\d{2}-\\d{2}$' THEN vencimiento_seguro::DATE ELSE NULL END;
+            ALTER TABLE bateas ALTER COLUMN seguro TYPE DATE USING NULLIF(seguro::text, '')::DATE;
+            ALTER TABLE bateas ALTER COLUMN vencimiento_seguro TYPE DATE USING NULLIF(vencimiento_seguro::text, '')::DATE;
             ALTER TABLE camiones
                 ADD COLUMN IF NOT EXISTS id BIGSERIAL,
                 ADD COLUMN IF NOT EXISTS itv DATE,
@@ -224,7 +224,7 @@ def preparar_tablas_flota(connection):
                 ADD COLUMN IF NOT EXISTS control_periodico DATE,
                 ADD COLUMN IF NOT EXISTS seguro DATE,
                 ADD COLUMN IF NOT EXISTS creado_en TIMESTAMPTZ DEFAULT NOW();
-            ALTER TABLE camiones ALTER COLUMN seguro TYPE DATE USING CASE WHEN seguro ~ '^\\d{4}-\\d{2}-\\d{2}$' THEN seguro::DATE ELSE NULL END;
+            ALTER TABLE camiones ALTER COLUMN seguro TYPE DATE USING NULLIF(seguro::text, '')::DATE;
             CREATE TABLE IF NOT EXISTS asignaciones_flota (
                 id BIGSERIAL PRIMARY KEY,
                 camion_id BIGINT,
