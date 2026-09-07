@@ -42,9 +42,12 @@ def preparar_tabla_remitos(connection):
             """
             CREATE TABLE IF NOT EXISTS remitos_app (
                 id BIGSERIAL PRIMARY KEY,
-                numero_remito BIGSERIAL UNIQUE NOT NULL,
+                numero_remito BIGINT UNIQUE NOT NULL,
                 fecha DATE NOT NULL,
                 chofer VARCHAR(150) NOT NULL,
+                cantera VARCHAR(200) NOT NULL DEFAULT '',
+                camion VARCHAR(30) NOT NULL DEFAULT '',
+                batea VARCHAR(30) NOT NULL DEFAULT '',
                 toneladas NUMERIC(12, 3) NOT NULL CHECK (toneladas >= 0),
                 material VARCHAR(200) NOT NULL,
                 tarifa NUMERIC(14, 2) NOT NULL CHECK (tarifa >= 0),
@@ -62,6 +65,9 @@ def preparar_tabla_remitos(connection):
                 ADD COLUMN IF NOT EXISTS numero_remito BIGSERIAL,
                 ADD COLUMN IF NOT EXISTS fecha DATE,
                 ADD COLUMN IF NOT EXISTS chofer VARCHAR(150),
+                ADD COLUMN IF NOT EXISTS cantera VARCHAR(200) DEFAULT '',
+                ADD COLUMN IF NOT EXISTS camion VARCHAR(30) DEFAULT '',
+                ADD COLUMN IF NOT EXISTS batea VARCHAR(30) DEFAULT '',
                 ADD COLUMN IF NOT EXISTS toneladas NUMERIC(12, 3),
                 ADD COLUMN IF NOT EXISTS material VARCHAR(200),
                 ADD COLUMN IF NOT EXISTS tarifa NUMERIC(14, 2),
@@ -69,6 +75,18 @@ def preparar_tabla_remitos(connection):
                 ADD COLUMN IF NOT EXISTS creado_por VARCHAR(150),
                 ADD COLUMN IF NOT EXISTS creado_en TIMESTAMPTZ DEFAULT NOW(),
                 ADD COLUMN IF NOT EXISTS actualizado_en TIMESTAMPTZ DEFAULT NOW()
+            """
+        )
+        cursor.execute("ALTER TABLE remitos_app ALTER COLUMN numero_remito TYPE BIGINT")
+        cursor.execute("ALTER TABLE remitos_app ALTER COLUMN cantera SET DEFAULT ''")
+        cursor.execute("ALTER TABLE remitos_app ALTER COLUMN camion SET DEFAULT ''")
+        cursor.execute("ALTER TABLE remitos_app ALTER COLUMN batea SET DEFAULT ''")
+        cursor.execute(
+            """
+            UPDATE remitos_app
+            SET cantera = COALESCE(cantera, ''), camion = COALESCE(camion, ''),
+                batea = COALESCE(batea, '')
+            WHERE cantera IS NULL OR camion IS NULL OR batea IS NULL
             """
         )
     connection.commit()
@@ -79,6 +97,18 @@ def preparar_tabla_usuarios(connection):
     with connection.cursor() as cursor:
         cursor.execute(
             "ALTER TABLE usuarios ALTER COLUMN password TYPE VARCHAR(255)"
+        )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS auditoria_app (
+                id BIGSERIAL PRIMARY KEY,
+                usuario VARCHAR(150) NOT NULL,
+                accion VARCHAR(100) NOT NULL,
+                documento VARCHAR(150) NOT NULL,
+                detalle TEXT NOT NULL,
+                ocurrido_en TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+            """
         )
     connection.commit()
 
@@ -110,6 +140,7 @@ def preparar_tablas_flota(connection):
                 seguro VARCHAR(150),
                 modelo INTEGER,
                 service DATE,
+                vencimiento_seguro DATE,
                 creado_en TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );
             CREATE TABLE IF NOT EXISTS camiones (
@@ -157,6 +188,7 @@ def preparar_tablas_flota(connection):
                 ADD COLUMN IF NOT EXISTS seguro VARCHAR(150),
                 ADD COLUMN IF NOT EXISTS modelo INTEGER,
                 ADD COLUMN IF NOT EXISTS service DATE,
+                ADD COLUMN IF NOT EXISTS vencimiento_seguro DATE,
                 ADD COLUMN IF NOT EXISTS creado_en TIMESTAMPTZ DEFAULT NOW();
             ALTER TABLE camiones
                 ADD COLUMN IF NOT EXISTS id BIGSERIAL,
@@ -181,6 +213,14 @@ def preparar_tablas_flota(connection):
                 DROP CONSTRAINT IF EXISTS asignaciones_flota_camion_id_fkey,
                 DROP CONSTRAINT IF EXISTS asignaciones_flota_batea_id_fkey,
                 DROP CONSTRAINT IF EXISTS asignaciones_flota_chofer_id_fkey;
+            CREATE TABLE IF NOT EXISTS auditoria_app (
+                id BIGSERIAL PRIMARY KEY,
+                usuario VARCHAR(150) NOT NULL,
+                accion VARCHAR(100) NOT NULL,
+                documento VARCHAR(150) NOT NULL,
+                detalle TEXT NOT NULL,
+                ocurrido_en TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
             """
         )
     connection.commit()
@@ -226,6 +266,95 @@ def mostrar_panel_errores():
         st.code(error["detalle"])
 
 
+def registrar_auditoria(cursor, accion, documento, detalle):
+    cursor.execute(
+        """
+        INSERT INTO auditoria_app (usuario, accion, documento, detalle)
+        VALUES (%s, %s, %s, %s)
+        """,
+        (
+            st.session_state.get("usuario_actual", "sistema"),
+            accion,
+            documento,
+            detalle,
+        ),
+    )
+
+
+def cargar_auditoria():
+    connection = obtener_conexion()
+    try:
+        return pd.read_sql_query(
+            """
+            SELECT ocurrido_en, usuario, accion, documento, detalle
+            FROM auditoria_app
+            ORDER BY ocurrido_en DESC, id DESC
+            LIMIT 500
+            """,
+            connection,
+        )
+    finally:
+        connection.close()
+
+
+def mostrar_panel_auditoria():
+    st.subheader("Historial de cambios")
+    try:
+        auditoria = cargar_auditoria()
+    except Exception as error:
+        mostrar_error("cargar el historial de cambios", error)
+        return
+    if auditoria.empty:
+        st.info("Todavía no hay cambios registrados.")
+        return
+    auditoria = auditoria.rename(
+        columns={
+            "ocurrido_en": "Fecha y hora",
+            "usuario": "Usuario",
+            "accion": "Acción",
+            "documento": "Documento",
+            "detalle": "Detalle",
+        }
+    )
+    st.dataframe(auditoria, use_container_width=True, hide_index=True)
+
+
+def cargar_opciones_distintas(tabla, columna):
+    tablas_permitidas = {"remitos_app", "choferes", "bateas", "camiones"}
+    columnas_permitidas = {
+        "cantera", "camion", "batea", "nombre_completo", "patente", "marca", "tipo"
+    }
+    if tabla not in tablas_permitidas or columna not in columnas_permitidas:
+        raise ValueError("Origen de opciones no permitido.")
+    connection = obtener_conexion()
+    try:
+        datos = pd.read_sql_query(
+            f"SELECT DISTINCT {columna} FROM {tabla} "
+            f"WHERE {columna} IS NOT NULL AND TRIM({columna}::text) <> '' "
+            f"ORDER BY {columna}",
+            connection,
+        )
+        return datos[columna].astype(str).tolist()
+    finally:
+        connection.close()
+
+
+def campo_con_memoria(label, opciones, valor_actual, key):
+    opciones = sorted(set(opciones) | ({str(valor_actual)} if valor_actual else set()))
+    selector_opciones = ["Escribir nuevo..."] + opciones
+    seleccion = st.selectbox(
+        f"{label} (elegir existente)",
+        selector_opciones,
+        index=selector_opciones.index(str(valor_actual))
+        if valor_actual and str(valor_actual) in selector_opciones
+        else 0,
+        key=f"seleccionar_{key}",
+    )
+    if seleccion == "Escribir nuevo...":
+        return st.text_input(label, value=str(valor_actual or ""), key=key).strip()
+    return seleccion
+
+
 def generar_hash_password(password):
     salt = secrets.token_bytes(16)
     digest = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, 310000)
@@ -265,7 +394,8 @@ def cargar_remitos():
     try:
         return pd.read_sql_query(
             """
-                 SELECT id, numero_remito, fecha, chofer, toneladas, material, tarifa, subtotal,
+                                 SELECT id, numero_remito, fecha, chofer, cantera, camion, batea,
+                                     toneladas, material, tarifa, subtotal,
                    creado_por, creado_en
                  FROM remitos_app
             ORDER BY fecha DESC, id DESC
@@ -348,6 +478,20 @@ def editar_recursos_flota(tabla, columnas, etiqueta):
                         f"UPDATE {tabla} SET {assignments} WHERE id = %s",
                         valores + [int(fila["id"])],
                     )
+                    registrar_auditoria(
+                        cursor,
+                        "Editar flota",
+                        f"{etiqueta} #{int(fila['id'])}",
+                        f"Se editaron los datos de {etiqueta[:-1]}.",
+                    )
+            connection.commit()
+            with connection.cursor() as cursor:
+                registrar_auditoria(
+                    cursor,
+                    "Editar asignaciones",
+                    "Cuadro de asignación operativa",
+                    "Se actualizaron las relaciones entre camiones, bateas, choferes y destinos.",
+                )
             connection.commit()
             connection.close()
             st.success("Cambios guardados.")
@@ -378,14 +522,14 @@ def mostrar_cuadro_asignaciones():
     camion_opciones = {"Sin asignar": None}
     camion_opciones.update(
         {
-            f"Camión {fila.id} | {fila.patente} | {fila.marca}": int(fila.id)
+            f"{fila.patente} | {fila.marca}": int(fila.id)
             for fila in camiones.itertuples()
         }
     )
     batea_opciones = {"Sin asignar": None}
     batea_opciones.update(
         {
-            f"Batea {fila.id} | {fila.patente} | {fila.marca}": int(fila.id)
+            f"{fila.patente} | {fila.marca}": int(fila.id)
             for fila in bateas.itertuples()
         }
     )
@@ -400,7 +544,6 @@ def mostrar_cuadro_asignaciones():
     with st.form("form_asignaciones"):
         asignaciones = []
         for indice in range(cantidad_filas):
-            st.markdown(f"**Unidad {indice + 1}**")
             col_camion, col_batea, col_chofer, col_destino = st.columns(4)
             with col_camion:
                 camion_guardado = (
@@ -491,29 +634,73 @@ def mostrar_cuadro_asignaciones():
 def mostrar_formulario_flota(tipo):
     st.subheader(f"Agregar {tipo}")
     with st.form(f"form_flota_{tipo.lower()}"):
+        try:
+            recursos_existentes = cargar_flota(
+                {"Chofer": "choferes", "Batea": "bateas", "Camión": "camiones"}[tipo]
+            )
+        except Exception:
+            recursos_existentes = pd.DataFrame()
+
         if tipo == "Chofer":
-            nombre = st.text_input("Nombre")
-            apellido = st.text_input("Apellido")
-            dni = st.text_input("DNI")
-            licencia = st.text_input("Nro. licencia")
+            etiquetas = ["Completar manualmente"] + (
+                recursos_existentes["nombre_completo"].fillna("").astype(str).tolist()
+                if not recursos_existentes.empty else []
+            )
+            fuente = st.selectbox("Autocompletar desde un chofer", etiquetas)
+            fila_fuente = (
+                recursos_existentes.loc[
+                    recursos_existentes["nombre_completo"].astype(str) == fuente
+                ].iloc[0]
+                if fuente != "Completar manualmente" else None
+            )
+            nombre = st.text_input("Nombre", value=str(fila_fuente["nombre"]) if fila_fuente is not None else "")
+            apellido = st.text_input("Apellido", value=str(fila_fuente["apellido"]) if fila_fuente is not None else "")
+            dni = st.text_input("DNI", value=str(fila_fuente["dni"]) if fila_fuente is not None and pd.notna(fila_fuente["dni"]) else "")
+            licencia = st.text_input("Nro. licencia", value=str(fila_fuente["nro_licencia"]) if fila_fuente is not None and pd.notna(fila_fuente["nro_licencia"]) else "")
             estado = st.selectbox("Estado", ["Activo", "Vacaciones", "Licencia"])
             vencimiento = st.date_input("Vencimiento licencia", value=date.today())
             preocupacional = st.date_input("Preocupacional", value=date.today())
-            cuil = st.text_input("CUIL")
-            curso = st.date_input("Curso de manejo", value=date.today())
+            curso = st.text_input(
+                "Curso de manejo",
+                value=str(fila_fuente["curso_manejo"])
+                if fila_fuente is not None and pd.notna(fila_fuente["curso_manejo"])
+                else "",
+            )
         elif tipo == "Batea":
-            patente = st.text_input("Patente")
+            etiquetas = ["Completar manualmente"] + (
+                recursos_existentes["patente"].astype(str).tolist()
+                if not recursos_existentes.empty else []
+            )
+            fuente = st.selectbox("Autocompletar desde una batea", etiquetas)
+            fila_fuente = (
+                recursos_existentes.loc[
+                    recursos_existentes["patente"].astype(str) == fuente
+                ].iloc[0]
+                if fuente != "Completar manualmente" else None
+            )
+            patente = st.text_input("Patente", value=str(fila_fuente["patente"]) if fila_fuente is not None else "")
             capacidad = st.number_input("Capacidad (toneladas)", min_value=0.0, step=0.001)
-            tipo_batea = st.text_input("Tipo")
-            marca = st.text_input("Marca")
-            seguro = st.text_input("Seguro")
+            tipo_batea = st.text_input("Tipo", value=str(fila_fuente["tipo"]) if fila_fuente is not None else "")
+            marca = st.text_input("Marca", value=str(fila_fuente["marca"]) if fila_fuente is not None else "")
+            vencimiento_seguro = st.date_input("Vencimiento seguro", value=date.today())
             modelo = st.number_input("Modelo (año)", min_value=1900, max_value=2100, value=2026)
             service = st.date_input("Service", value=date.today())
         else:
+            etiquetas = ["Completar manualmente"] + (
+                recursos_existentes["patente"].astype(str).tolist()
+                if not recursos_existentes.empty else []
+            )
+            fuente = st.selectbox("Autocompletar desde un camión", etiquetas)
+            fila_fuente = (
+                recursos_existentes.loc[
+                    recursos_existentes["patente"].astype(str) == fuente
+                ].iloc[0]
+                if fuente != "Completar manualmente" else None
+            )
             itv = st.date_input("ITV", value=date.today())
             service = st.date_input("Service", value=date.today())
-            patente = st.text_input("Patente")
-            marca = st.text_input("Marca")
+            patente = st.text_input("Patente", value=str(fila_fuente["patente"]) if fila_fuente is not None else "")
+            marca = st.text_input("Marca", value=str(fila_fuente["marca"]) if fila_fuente is not None else "")
             estado = st.selectbox("Estado", ["Roto", "Funcional", "Pausa"])
             kilometraje = st.number_input("Kilometraje", min_value=0.0, step=1.0)
             control = st.date_input("Control periódico", value=date.today())
@@ -536,13 +723,13 @@ def mostrar_formulario_flota(tipo):
                     """
                     INSERT INTO choferes
                         (nombre_completo, nombre, apellido, dni, nro_licencia, estado,
-                     vencimiento_licencia, preocupacional, cuil, curso_manejo)
+                     vencimiento_licencia, preocupacional, curso_manejo)
                         VALUES (%s, %s, %s, NULLIF(%s, ''), NULLIF(%s, ''), %s,
-                            %s, %s, NULLIF(%s, ''), %s)
+                            %s, %s, %s)
                     """,
                         (f"{nombre.strip()} {apellido.strip()}", nombre.strip(),
                          apellido.strip(), dni.strip(), licencia.strip(), estado,
-                         vencimiento, preocupacional, cuil.strip(), curso.isoformat()),
+                         vencimiento, preocupacional, curso.isoformat()),
                 )
             elif tipo == "Batea":
                 if not all([patente.strip(), tipo_batea.strip(), marca.strip()]):
@@ -552,11 +739,11 @@ def mostrar_formulario_flota(tipo):
                 cursor.execute(
                     """
                     INSERT INTO bateas
-                    (patente, capacidad, tipo, marca, seguro, modelo, service)
+                    (patente, capacidad, tipo, marca, vencimiento_seguro, modelo, service)
                     VALUES (%s, %s, %s, %s, %s, %s, %s)
                     """,
                     (patente.strip(), capacidad, tipo_batea.strip(), marca.strip(),
-                     seguro.strip(), modelo, service),
+                     vencimiento_seguro, modelo, service),
                 )
             else:
                 if not all([patente.strip(), marca.strip()]):
@@ -574,6 +761,14 @@ def mostrar_formulario_flota(tipo):
                      kilometraje, control, seguro.strip()),
                 )
         connection.commit()
+        with connection.cursor() as cursor:
+            registrar_auditoria(
+                cursor,
+                "Crear flota",
+                f"{tipo} {patente if tipo != 'Chofer' else nombre + ' ' + apellido}",
+                f"Se agregó un nuevo recurso de tipo {tipo}.",
+            )
+        connection.commit()
         connection.close()
         st.session_state.mostrar_formulario_flota = False
         st.success(f"{tipo} guardado correctamente.")
@@ -590,6 +785,11 @@ def formulario_remito(remito=None):
     st.subheader("Editar remito" if editando else "Cargar remito manual")
 
     with st.form(f"form_remito_{identificador}"):
+        numero_remito = st.text_input(
+            "Número de remito",
+            value=str(remito["numero_remito"]) if editando else "",
+            help="Ingresá el número real del remito; puede ser largo y no se genera automáticamente.",
+        )
         try:
             choferes = cargar_choferes_activos()
         except Exception as error:
@@ -621,6 +821,22 @@ def formulario_remito(remito=None):
             if editando
             else date.today(),
         )
+        try:
+            canteras = cargar_opciones_distintas("remitos_app", "cantera")
+            camiones = cargar_opciones_distintas("camiones", "patente")
+            bateas = cargar_opciones_distintas("bateas", "patente")
+        except Exception as error:
+            canteras, camiones, bateas = [], [], []
+            registrar_error("cargar opciones de remito", error)
+        cantera = campo_con_memoria(
+            "Cantera", canteras, remito.get("cantera", "") if editando else "", "remito_cantera"
+        )
+        camion = campo_con_memoria(
+            "Camión", camiones, remito.get("camion", "") if editando else "", "remito_camion"
+        )
+        batea = campo_con_memoria(
+            "Batea", bateas, remito.get("batea", "") if editando else "", "remito_batea"
+        )
         toneladas = st.number_input(
             "Toneladas",
             min_value=0.0,
@@ -647,8 +863,11 @@ def formulario_remito(remito=None):
 
     if not guardar:
         return
-    if not chofer.strip() or not material.strip():
-        st.warning("Completá la fecha, el chofer y el material.")
+    if not numero_remito.strip().isdigit() or int(numero_remito) <= 0:
+        st.warning("Ingresá un número de remito entero y mayor que cero.")
+        return
+    if not chofer.strip() or not cantera or not material.strip():
+        st.warning("Completá el número, la fecha, el chofer, la cantera y el material.")
         return
 
     try:
@@ -664,14 +883,19 @@ def formulario_remito(remito=None):
                     cursor.execute(
                         """
                         UPDATE remitos_app
-                        SET fecha = %s, chofer = %s, toneladas = %s,
-                            material = %s, tarifa = %s, subtotal = %s,
+                        SET numero_remito = %s, fecha = %s, chofer = %s,
+                            cantera = %s, camion = %s, batea = %s,
+                            toneladas = %s, material = %s, tarifa = %s, subtotal = %s,
                             actualizado_en = NOW()
                         WHERE id = %s
                         """,
                         (
+                            int(numero_remito),
                             fecha,
                             chofer.strip(),
+                            cantera,
+                            camion,
+                            batea,
                             toneladas_decimal,
                             material.strip(),
                             tarifa_decimal,
@@ -679,23 +903,39 @@ def formulario_remito(remito=None):
                             int(remito["id"]),
                         ),
                     )
+                    registrar_auditoria(
+                        cursor,
+                        "Editar remito",
+                        f"Remito #{numero_remito}",
+                        f"Se actualizaron fecha, chofer, cantera, camión, batea, toneladas, material y tarifa.",
+                    )
                 else:
                     cursor.execute(
                         """
                         INSERT INTO remitos_app
-                            (fecha, chofer, toneladas, material, tarifa,
-                             subtotal, creado_por)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s)
+                            (numero_remito, fecha, chofer, cantera, camion, batea,
+                             toneladas, material, tarifa, subtotal, creado_por)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                         """,
                         (
+                            int(numero_remito),
                             fecha,
                             chofer.strip(),
+                            cantera,
+                            camion,
+                            batea,
                             toneladas_decimal,
                             material.strip(),
                             tarifa_decimal,
                             subtotal_decimal,
                             st.session_state.usuario_actual,
                         ),
+                    )
+                    registrar_auditoria(
+                        cursor,
+                        "Crear remito",
+                        f"Remito #{numero_remito}",
+                        f"Se cargó el remito con cantera {cantera}, camión {camion or 'sin asignar'} y batea {batea or 'sin asignar'}.",
                     )
             connection.commit()
         finally:
@@ -845,7 +1085,7 @@ if st.session_state.usuario_actual is None:
     mostrar_login()
     st.stop()
 
-header_col, help_col, logout_col = st.columns([7, 1, 2])
+header_col, help_col, audit_col, logout_col = st.columns([6, 1, 1.5, 1.5])
 with header_col:
     st.title("🚛 Sistema de gestión Logística y Minería")
     st.write(
@@ -857,6 +1097,11 @@ with help_col:
         st.session_state.mostrar_errores = not st.session_state.get(
             "mostrar_errores", False
         )
+with audit_col:
+    if st.button("🕘", help="Ver quién modificó cada documento y cuándo"):
+        st.session_state.mostrar_auditoria = not st.session_state.get(
+            "mostrar_auditoria", False
+        )
 with logout_col:
     if st.button("🚪 Cerrar sesión"):
         cerrar_sesion()
@@ -864,6 +1109,10 @@ with logout_col:
 if st.session_state.get("mostrar_errores", False):
     with st.container(border=True):
         mostrar_panel_errores()
+
+if st.session_state.get("mostrar_auditoria", False):
+    with st.container(border=True):
+        mostrar_panel_auditoria()
 
 try:
     connection = obtener_conexion()
@@ -923,6 +1172,9 @@ with tabs[0]:
                 "numero_remito": "N° Remito",
                 "fecha": "Fecha",
                 "chofer": "Chofer",
+                "cantera": "Cantera",
+                "camion": "Camión",
+                "batea": "Batea",
                 "toneladas": "Toneladas",
                 "material": "Material",
                 "tarifa": "Tarifa",
@@ -936,6 +1188,9 @@ with tabs[0]:
                     "N° Remito",
                     "Fecha",
                     "Chofer",
+                    "Cantera",
+                    "Camión",
+                    "Batea",
                     "Toneladas",
                     "Material",
                     "Tarifa",
@@ -983,7 +1238,7 @@ with tabs[1]:
             "choferes",
             [
                 "nombre_completo", "nombre", "apellido", "dni", "nro_licencia",
-                "estado", "vencimiento_licencia", "preocupacional", "cuil",
+            "estado", "vencimiento_licencia", "preocupacional",
                 "curso_manejo",
             ],
             "choferes",
@@ -991,7 +1246,7 @@ with tabs[1]:
         st.subheader("Bateas")
         editar_recursos_flota(
             "bateas",
-            ["patente", "capacidad", "tipo", "marca", "seguro", "modelo", "service"],
+            ["patente", "capacidad", "tipo", "marca", "vencimiento_seguro", "modelo", "service"],
             "bateas",
         )
         st.subheader("Camiones")
