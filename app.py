@@ -93,10 +93,30 @@ def preparar_tabla_remitos(connection):
 
 
 def preparar_tabla_usuarios(connection):
-    """Deja espacio suficiente para hashes de contraseñas."""
+    """Crea la base mínima para autenticación y auditoría si aún no existe."""
     with connection.cursor() as cursor:
         cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS usuarios (
+                id BIGSERIAL PRIMARY KEY,
+                nombre_usuario VARCHAR(150) NOT NULL UNIQUE,
+                password VARCHAR(255) NOT NULL,
+                rol VARCHAR(50) NOT NULL DEFAULT 'Operador',
+                estado VARCHAR(30) NOT NULL DEFAULT 'Pendiente',
+                creado_en TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+            """
+        )
+        cursor.execute(
             "ALTER TABLE usuarios ALTER COLUMN password TYPE VARCHAR(255)"
+        )
+        cursor.execute(
+            """
+            ALTER TABLE usuarios
+                ADD COLUMN IF NOT EXISTS rol VARCHAR(50) DEFAULT 'Operador',
+                ADD COLUMN IF NOT EXISTS estado VARCHAR(30) DEFAULT 'Pendiente',
+                ADD COLUMN IF NOT EXISTS creado_en TIMESTAMPTZ DEFAULT NOW();
+            """
         )
         cursor.execute(
             """
