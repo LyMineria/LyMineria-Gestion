@@ -12,6 +12,7 @@ import streamlit as st
 ADMIN_USER = "OcampoElio"
 
 
+@st.cache_resource(ttl=1800)
 def obtener_conexion():
     """Abre PostgreSQL usando únicamente secrets de Streamlit."""
     config = st.secrets["database"] if "database" in st.secrets else st.secrets
@@ -177,6 +178,30 @@ def preparar_tablas_flota(connection):
             );
             """
         )
+        
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS canteras (
+                id BIGSERIAL PRIMARY KEY,
+                nombre VARCHAR(200) NOT NULL UNIQUE,
+                creado_en TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            CREATE TABLE IF NOT EXISTS facturas (
+                id BIGSERIAL PRIMARY KEY,
+                cantera_id BIGINT NOT NULL REFERENCES canteras(id) ON DELETE CASCADE,
+                nombre VARCHAR(200) NOT NULL,
+                fecha DATE NOT NULL,
+                total NUMERIC(16, 2) NOT NULL DEFAULT 0,
+                creado_en TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            CREATE TABLE IF NOT EXISTS factura_remitos (
+                id BIGSERIAL PRIMARY KEY,
+                factura_id BIGINT NOT NULL REFERENCES facturas(id) ON DELETE CASCADE,
+                remito_id BIGINT NOT NULL REFERENCES remitos_app(id) ON DELETE CASCADE,
+                UNIQUE (factura_id, remito_id)
+            );
+            """
+        )
         cursor.execute(
             """
             ALTER TABLE choferes
@@ -305,6 +330,7 @@ def registrar_auditoria(cursor, accion, documento, detalle):
     )
 
 
+@st.cache_data(ttl=10)
 def cargar_auditoria():
     connection = obtener_conexion()
     try:
@@ -343,6 +369,7 @@ def mostrar_panel_auditoria():
     st.dataframe(auditoria, use_container_width=True, hide_index=True)
 
 
+@st.cache_data(ttl=30)
 def cargar_opciones_distintas(tabla, columna):
     tablas_permitidas = {"remitos_app", "choferes", "bateas", "camiones"}
     columnas_permitidas = {
@@ -359,6 +386,94 @@ def cargar_opciones_distintas(tabla, columna):
             connection,
         )
         return datos[columna].astype(str).tolist()
+    finally:
+        connection.close()
+
+
+@st.cache_data(ttl=30)
+def cargar_canteras():
+    connection = obtener_conexion()
+    try:
+        return pd.read_sql_query(
+            "SELECT id, nombre FROM canteras ORDER BY nombre",
+            connection,
+        )
+    finally:
+        connection.close()
+
+
+def guardar_cantera(nombre):
+    nombre_limpio = (nombre or "").strip()
+    if not nombre_limpio:
+        raise ValueError("La cantera no puede estar vacía.")
+    connection = obtener_conexion()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "INSERT INTO canteras (nombre) VALUES (%s) ON CONFLICT (nombre) DO NOTHING",
+                (nombre_limpio,),
+            )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+@st.cache_data(ttl=30)
+def obtener_facturas_por_cantera(cantera_id):
+    connection = obtener_conexion()
+    try:
+        return pd.read_sql_query(
+            """
+            SELECT f.id, f.nombre, f.fecha,
+                   COUNT(fr.remito_id) AS remitos,
+                   COALESCE(SUM(r.subtotal), 0) AS total
+            FROM facturas f
+            LEFT JOIN factura_remitos fr ON fr.factura_id = f.id
+            LEFT JOIN remitos_app r ON r.id = fr.remito_id
+            WHERE f.cantera_id = %s
+            GROUP BY f.id, f.nombre, f.fecha
+            ORDER BY f.fecha DESC, f.id DESC
+            """,
+            connection,
+            params=(int(cantera_id),),
+        )
+    finally:
+        connection.close()
+
+
+@st.cache_data(ttl=30)
+def obtener_remitos_facturacion(cantera_nombre):
+    connection = obtener_conexion()
+    try:
+        return pd.read_sql_query(
+            """
+            SELECT id, numero_remito, fecha, chofer, material, subtotal
+            FROM remitos_app
+            WHERE cantera = %s
+            ORDER BY fecha DESC, id DESC
+            """,
+            connection,
+            params=(cantera_nombre,),
+        )
+    finally:
+        connection.close()
+
+
+def crear_factura(cantera_id, nombre, fecha, remitos_ids):
+    connection = obtener_conexion()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "INSERT INTO facturas (cantera_id, nombre, fecha) VALUES (%s, %s, %s) RETURNING id",
+                (int(cantera_id), nombre.strip(), fecha),
+            )
+            factura_id = cursor.fetchone()[0]
+            for remito_id in remitos_ids:
+                cursor.execute(
+                    "INSERT INTO factura_remitos (factura_id, remito_id) VALUES (%s, %s) ON CONFLICT DO NOTHING",
+                    (factura_id, int(remito_id)),
+                )
+        connection.commit()
     finally:
         connection.close()
 
@@ -413,6 +528,7 @@ def decimal_positivo(value, nombre):
     return number
 
 
+@st.cache_data(ttl=10)
 def cargar_remitos():
     connection = obtener_conexion()
     try:
@@ -430,6 +546,7 @@ def cargar_remitos():
         connection.close()
 
 
+@st.cache_data(ttl=30)
 def cargar_choferes_activos():
     connection = obtener_conexion()
     try:
@@ -446,6 +563,7 @@ def cargar_choferes_activos():
         connection.close()
 
 
+@st.cache_data(ttl=30)
 def cargar_flota(tabla):
     connection = obtener_conexion()
     try:
@@ -528,7 +646,7 @@ def editar_recursos_flota(tabla, columnas, etiqueta):
 
 def mostrar_cuadro_asignaciones():
     st.subheader("Asignación operativa")
-    st.caption("Elegí qué camion, batea y chofer trabajan juntos y definí el destino.")
+    st.caption("Elegí qué camión, batea, chofer y destino trabajan juntos.")
     try:
         camiones = cargar_flota("camiones")
         bateas = cargar_flota("bateas")
@@ -546,26 +664,36 @@ def mostrar_cuadro_asignaciones():
     camion_opciones = {"Sin asignar": None}
     camion_opciones.update(
         {
-            f"{fila.patente} | {fila.marca}": int(fila.id)
+            str(fila.patente): int(fila.id)
             for fila in camiones.itertuples()
         }
     )
     batea_opciones = {"Sin asignar": None}
     batea_opciones.update(
         {
-            f"{fila.patente} | {fila.marca}": int(fila.id)
+            str(fila.patente): int(fila.id)
             for fila in bateas.itertuples()
         }
     )
     chofer_opciones = {"Sin asignar": None}
     chofer_opciones.update(
         {
-            f"Chofer {fila.id} | {fila.nombre} {fila.apellido}": int(fila.id)
+            f"{fila.nombre} {fila.apellido}": int(fila.id)
             for fila in choferes.itertuples()
         }
     )
     cantidad_filas = max(len(camiones), len(bateas), len(choferes), 1)
     with st.form("form_asignaciones"):
+        encabezado_camion, encabezado_batea, encabezado_chofer, encabezado_destino = st.columns(4)
+        with encabezado_camion:
+            st.caption("Camión")
+        with encabezado_batea:
+            st.caption("Batea")
+        with encabezado_chofer:
+            st.caption("Chofer")
+        with encabezado_destino:
+            st.caption("Destino")
+
         asignaciones = []
         for indice in range(cantidad_filas):
             col_camion, col_batea, col_chofer, col_destino = st.columns(4)
@@ -581,8 +709,11 @@ def mostrar_cuadro_asignaciones():
                     0,
                 )
                 camion = st.selectbox(
-                    "Camión", list(camion_opciones), index=camion_index,
-                    key=f"asig_camion_{indice}"
+                    "",
+                    list(camion_opciones),
+                    index=camion_index,
+                    key=f"asig_camion_{indice}",
+                    label_visibility="collapsed",
                 )
             with col_batea:
                 batea_guardada = (
@@ -596,8 +727,11 @@ def mostrar_cuadro_asignaciones():
                     0,
                 )
                 batea = st.selectbox(
-                    "Batea", list(batea_opciones), index=batea_index,
-                    key=f"asig_batea_{indice}"
+                    "",
+                    list(batea_opciones),
+                    index=batea_index,
+                    key=f"asig_batea_{indice}",
+                    label_visibility="collapsed",
                 )
             with col_chofer:
                 chofer_guardado = (
@@ -611,8 +745,11 @@ def mostrar_cuadro_asignaciones():
                     0,
                 )
                 chofer = st.selectbox(
-                    "Chofer", list(chofer_opciones), index=chofer_index,
-                    key=f"asig_chofer_{indice}"
+                    "",
+                    list(chofer_opciones),
+                    index=chofer_index,
+                    key=f"asig_chofer_{indice}",
+                    label_visibility="collapsed",
                 )
             with col_destino:
                 destino_guardado = (
@@ -621,8 +758,10 @@ def mostrar_cuadro_asignaciones():
                     else ""
                 )
                 destino = st.text_input(
-                    "Destino", value=destino_guardado or "",
-                    key=f"asig_destino_{indice}"
+                    "",
+                    value=destino_guardado or "",
+                    key=f"asig_destino_{indice}",
+                    label_visibility="collapsed",
                 )
             asignaciones.append(
                 (camion_opciones[camion], batea_opciones[batea],
@@ -826,11 +965,6 @@ def formulario_remito(remito=None):
     st.subheader("Editar remito" if editando else "Cargar remito manual")
 
     with st.form(f"form_remito_{identificador}"):
-        numero_remito = st.text_input(
-            "Número de remito",
-            value=str(remito["numero_remito"]) if editando else "",
-            help="Ingresá el número real del remito; puede ser largo y no se genera automáticamente.",
-        )
         try:
             choferes = cargar_choferes_activos()
         except Exception as error:
@@ -842,7 +976,7 @@ def formulario_remito(remito=None):
             st.warning("Primero cargá un chofer con estado Activo en Flota.")
             return
         choferes["etiqueta"] = choferes.apply(
-            lambda row: f"{row['nombre']} {row['apellido']} (ID {row['id']})",
+            lambda row: f"{row['nombre']} {row['apellido']}",
             axis=1,
         )
         opciones_chofer = choferes["etiqueta"].tolist()
@@ -851,52 +985,78 @@ def formulario_remito(remito=None):
             (
                 index
                 for index, etiqueta in enumerate(opciones_chofer)
-                if etiqueta.startswith(chofer_actual + " ")
+                if etiqueta == chofer_actual
             ),
             0,
         )
-        chofer = st.selectbox("Chofer", opciones_chofer, index=indice_chofer)
-        fecha = st.date_input(
-            "Fecha",
-            value=pd.to_datetime(remito["fecha"]).date()
-            if editando
-            else date.today(),
-        )
-        try:
-            canteras = cargar_opciones_distintas("remitos_app", "cantera")
-            camiones = cargar_opciones_distintas("camiones", "patente")
-            bateas = cargar_opciones_distintas("bateas", "patente")
-        except Exception as error:
-            canteras, camiones, bateas = [], [], []
-            registrar_error("cargar opciones de remito", error)
-        cantera = campo_con_memoria(
-            "Cantera", canteras, remito.get("cantera", "") if editando else "", "remito_cantera"
-        )
-        camion = campo_con_memoria(
-            "Camión", camiones, remito.get("camion", "") if editando else "", "remito_camion"
-        )
-        batea = campo_con_memoria(
-            "Batea", bateas, remito.get("batea", "") if editando else "", "remito_batea"
-        )
-        toneladas = st.number_input(
-            "Toneladas",
-            min_value=0.0,
-            value=float(remito["toneladas"]) if editando else 0.0,
-            step=0.001,
-            format="%.3f",
-        )
-        material = st.text_input(
-            "Material", value=str(remito["material"]) if editando else ""
-        )
-        tarifa = st.number_input(
-            "Tarifa por tonelada",
-            min_value=0.0,
-            value=float(remito["tarifa"]) if editando else 0.0,
-            step=0.01,
-            format="%.2f",
-        )
-        subtotal = Decimal(str(toneladas)) * Decimal(str(tarifa))
-        st.metric("Subtotal (sin IVA)", f"$ {subtotal:,.2f}")
+
+        col_numero, col_chofer = st.columns(2)
+        with col_numero:
+            numero_remito = st.text_input(
+                "Número de remito",
+                value=str(remito["numero_remito"]) if editando else "",
+                help="Ingresá el número real del remito; puede ser largo y no se genera automáticamente.",
+            )
+        with col_chofer:
+            chofer = st.selectbox("Chofer", opciones_chofer, index=indice_chofer)
+
+        col_fecha, col_cantera = st.columns(2)
+        with col_fecha:
+            fecha = st.date_input(
+                "Fecha",
+                value=pd.to_datetime(remito["fecha"]).date()
+                if editando
+                else date.today(),
+            )
+        with col_cantera:
+            try:
+                canteras = cargar_opciones_distintas("remitos_app", "cantera")
+                camiones = cargar_opciones_distintas("camiones", "patente")
+                bateas = cargar_opciones_distintas("bateas", "patente")
+            except Exception as error:
+                canteras, camiones, bateas = [], [], []
+                registrar_error("cargar opciones de remito", error)
+            cantera = campo_con_memoria(
+                "Cantera", canteras, remito.get("cantera", "") if editando else "", "remito_cantera"
+            )
+
+        col_camion, col_batea = st.columns(2)
+        with col_camion:
+            camion = campo_con_memoria(
+                "Camión", camiones, remito.get("camion", "") if editando else "", "remito_camion"
+            )
+        with col_batea:
+            batea = campo_con_memoria(
+                "Batea", bateas, remito.get("batea", "") if editando else "", "remito_batea"
+            )
+
+        col_toneladas, col_material = st.columns(2)
+        with col_toneladas:
+            toneladas = st.number_input(
+                "Toneladas",
+                min_value=0.0,
+                value=float(remito["toneladas"]) if editando else 0.0,
+                step=0.001,
+                format="%.3f",
+            )
+        with col_material:
+            material = st.text_input(
+                "Material", value=str(remito["material"]) if editando else ""
+            )
+
+        col_tarifa, col_subtotal = st.columns(2)
+        with col_tarifa:
+            tarifa = st.number_input(
+                "Tarifa por tonelada",
+                min_value=0.0,
+                value=float(remito["tarifa"]) if editando else 0.0,
+                step=0.01,
+                format="%.2f",
+            )
+        with col_subtotal:
+            subtotal = Decimal(str(toneladas)) * Decimal(str(tarifa))
+            st.metric("Subtotal (sin IVA)", f"$ {subtotal:,.2f}")
+
         guardar = st.form_submit_button(
             "Actualizar remito" if editando else "Guardar remito",
             type="primary",
@@ -994,89 +1154,91 @@ def mostrar_login():
     tab_login, tab_registro = st.tabs(["🔑 Iniciar Sesión", "📝 Registrarse"])
 
     with tab_login:
-        user = st.text_input("Usuario", key="login_user")
-        password = st.text_input("Contraseña", type="password", key="login_pass")
-        if st.button("Ingresar", type="primary"):
-            try:
-                connection = obtener_conexion()
-                with connection.cursor() as cursor:
-                    cursor.execute(
-                        """
-                        SELECT rol, estado, password FROM usuarios
-                        WHERE nombre_usuario = %s
-                        """,
-                        (user,),
-                    )
-                    result = cursor.fetchone()
-                connection.close()
-                password_ok, legacy_password = (
-                    verificar_password(password, result[2]) if result else (False, False)
-                )
-                if password_ok and result[1] == "Aprobado":
-                    if legacy_password:
-                        connection = obtener_conexion()
-                        with connection.cursor() as cursor:
-                            cursor.execute(
-                                "UPDATE usuarios SET password = %s WHERE nombre_usuario = %s",
-                                (generar_hash_password(password), user),
-                            )
-                        connection.commit()
-                        connection.close()
-                    st.session_state.usuario_actual = user
-                    st.session_state.rol_usuario = result[0]
-                    st.rerun()
-                elif password_ok and result[1] == "Pendiente":
-                    st.warning("Tu cuenta está pendiente de aprobación.")
-                elif result:
-                    st.error("Tu acceso fue rechazado o deshabilitado.")
-                else:
-                    st.error("Usuario o contraseña incorrectos.")
-            except psycopg2.Error as error:
-                st.error("PostgreSQL rechazó la conexión.")
-                registrar_error("iniciar sesión", error)
-                st.caption(
-                    "Revisá host, base, usuario, contraseña y puerto en Secrets."
-                )
-                st.code(str(error).splitlines()[0])
-            except Exception as error:
-                st.error("No se pudo iniciar sesión.")
-                registrar_error("iniciar sesión", error)
-                st.caption(f"Detalle técnico: {error}")
-
-    with tab_registro:
-        nuevo_user = st.text_input("Elegí un nombre de usuario", key="reg_user")
-        nueva_pass = st.text_input(
-            "Elegí una contraseña", type="password", key="reg_pass"
-        )
-        if st.button("Solicitar acceso"):
-            if not nuevo_user.strip() or not nueva_pass:
-                st.warning("Completá todos los campos.")
-            else:
+        with st.form("form_login"):
+            user = st.text_input("Usuario", key="login_user")
+            password = st.text_input("Contraseña", type="password", key="login_pass")
+            if st.form_submit_button("Ingresar", type="primary"):
                 try:
                     connection = obtener_conexion()
                     with connection.cursor() as cursor:
                         cursor.execute(
-                            "SELECT 1 FROM usuarios WHERE nombre_usuario = %s",
-                            (nuevo_user.strip(),),
+                            """
+                            SELECT rol, estado, password FROM usuarios
+                            WHERE nombre_usuario = %s
+                            """,
+                            (user,),
                         )
-                        if cursor.fetchone():
-                            st.error("El usuario ya existe.")
-                        else:
-                            cursor.execute(
-                                """
-                                INSERT INTO usuarios
-                                    (nombre_usuario, password, rol, estado)
-                                VALUES (%s, %s, 'Operador', 'Pendiente')
-                                """,
-                                (nuevo_user.strip(), generar_hash_password(nueva_pass)),
-                            )
-                            connection.commit()
-                            st.success(
-                                "Registro completado. Falta la aprobación del administrador."
-                            )
+                        result = cursor.fetchone()
                     connection.close()
-                except Exception:
-                    mostrar_error("registrar el usuario")
+                    password_ok, legacy_password = (
+                        verificar_password(password, result[2]) if result else (False, False)
+                    )
+                    if password_ok and result[1] == "Aprobado":
+                        if legacy_password:
+                            connection = obtener_conexion()
+                            with connection.cursor() as cursor:
+                                cursor.execute(
+                                    "UPDATE usuarios SET password = %s WHERE nombre_usuario = %s",
+                                    (generar_hash_password(password), user),
+                                )
+                            connection.commit()
+                            connection.close()
+                        st.session_state.usuario_actual = user
+                        st.session_state.rol_usuario = result[0]
+                        st.rerun()
+                    elif password_ok and result[1] == "Pendiente":
+                        st.warning("Tu cuenta está pendiente de aprobación.")
+                    elif result:
+                        st.error("Tu acceso fue rechazado o deshabilitado.")
+                    else:
+                        st.error("Usuario o contraseña incorrectos.")
+                except psycopg2.Error as error:
+                    st.error("PostgreSQL rechazó la conexión.")
+                    registrar_error("iniciar sesión", error)
+                    st.caption(
+                        "Revisá host, base, usuario, contraseña y puerto en Secrets."
+                    )
+                    st.code(str(error).splitlines()[0])
+                except Exception as error:
+                    st.error("No se pudo iniciar sesión.")
+                    registrar_error("iniciar sesión", error)
+                    st.caption(f"Detalle técnico: {error}")
+
+    with tab_registro:
+        with st.form("form_registro"):
+            nuevo_user = st.text_input("Elegí un nombre de usuario", key="reg_user")
+            nueva_pass = st.text_input(
+                "Elegí una contraseña", type="password", key="reg_pass"
+            )
+            if st.form_submit_button("Solicitar acceso"):
+                if not nuevo_user.strip() or not nueva_pass:
+                    st.warning("Completá todos los campos.")
+                else:
+                    try:
+                        connection = obtener_conexion()
+                        with connection.cursor() as cursor:
+                            cursor.execute(
+                                "SELECT 1 FROM usuarios WHERE nombre_usuario = %s",
+                                (nuevo_user.strip(),),
+                            )
+                            if cursor.fetchone():
+                                st.error("El usuario ya existe.")
+                            else:
+                                cursor.execute(
+                                    """
+                                    INSERT INTO usuarios
+                                        (nombre_usuario, password, rol, estado)
+                                    VALUES (%s, %s, 'Operador', 'Pendiente')
+                                    """,
+                                    (nuevo_user.strip(), generar_hash_password(nueva_pass)),
+                                )
+                                connection.commit()
+                                st.success(
+                                    "Registro completado. Falta la aprobación del administrador."
+                                )
+                        connection.close()
+                    except Exception:
+                        mostrar_error("registrar el usuario")
 
 
 st.set_page_config(
@@ -1089,20 +1251,30 @@ st.set_page_config(
 st.markdown(
     """
     <style>
-    :root { --ink: #f4f7fb; --muted: #9aa7b8; --line: #263244; --accent: #ff5a52; }
+    :root { --ink: #f4f7fb; --muted: #9aa7b8; --line: #263244; --accent: #ff5a52; --panel: #111b28; --soft: #1a2635; }
+    * { transition: none !important; animation: none !important; animation-duration: 0s !important; animation-delay: 0s !important; }
     .stApp { background: #0b1118; color: var(--ink); }
-    .block-container { max-width: 1280px; padding-top: 2.2rem; padding-bottom: 3rem; }
-    h1 { letter-spacing: -0.02em; font-weight: 750; }
-    h2, h3 { letter-spacing: -0.01em; }
+    .block-container { max-width: 1320px; padding-top: 1.2rem; padding-bottom: 2rem; }
+    h1 { letter-spacing: -0.03em; font-weight: 800; }
+    h2, h3 { letter-spacing: -0.02em; }
     [data-testid="stHeader"] { background: transparent; }
-    [data-testid="stMetric"] { background: #131c27; border: 1px solid var(--line); padding: 1rem; border-radius: 12px; }
-    [data-testid="stForm"] { background: #101923; border: 1px solid var(--line); border-radius: 12px; padding: 1.1rem; }
-    [data-testid="stDataFrame"] { border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
-    .stButton > button { border-radius: 8px; font-weight: 650; }
+    [data-testid="stMetric"] { background: #131c27; border: 1px solid var(--line); padding: 0.85rem 1rem; border-radius: 12px; }
+    [data-testid="stForm"] { background: rgba(17, 27, 40, 0.92); border: 1px solid var(--line); border-radius: 12px; padding: 0.9rem; }
+    [data-testid="stDataFrame"] { border: 1px solid var(--line); border-radius: 12px; overflow: hidden; }
+    [data-testid="stContainer"] { gap: 0.25rem; }
+    .stButton > button { border-radius: 10px; font-weight: 650; padding: 0.45rem 0.8rem; }
     .stButton > button[kind="primary"] { background: var(--accent); border-color: var(--accent); }
     div[data-baseweb="tab-list"] { gap: 0.35rem; border-bottom: 1px solid var(--line); }
-    button[data-baseweb="tab"] { color: var(--muted); padding: 0.75rem 0.9rem; }
-    button[data-baseweb="tab"][aria-selected="true"] { color: var(--ink); }
+    button[data-baseweb="tab"] { color: var(--muted); padding: 0.55rem 0.8rem; border-radius: 10px 10px 0 0; }
+    button[data-baseweb="tab"][aria-selected="true"] { color: var(--ink); background: rgba(255,255,255,0.02); }
+    .stSelectbox > div, .stTextInput > div, .stDateInput > div, .stNumberInput > div, .stMultiselect > div { border-radius: 10px; }
+    .stForm { gap: 0.15rem; }
+    .stForm > div { gap: 0.15rem; }
+    .stDataFrame .stDataFrameContainer { padding: 0; }
+    .stExpander { border-radius: 10px; border: 1px solid var(--line); }
+    .stTabs [data-testid="stVerticalBlockBorderWrapper"] { gap: 0.15rem; }
+    .stMarkdown p, .stMarkdown li { margin: 0.15rem 0; }
+    .css-1d391kg, .css-18ni7ap { padding-top: 0.2rem; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -1120,6 +1292,18 @@ except Exception as error:
     st.error("No se pudo preparar la tabla de usuarios.")
     registrar_error("preparar tabla de usuarios", error)
     st.caption(f"Detalle técnico: {error}")
+    st.stop()
+
+try:
+    connection = obtener_conexion()
+    preparar_tabla_remitos(connection)
+    preparar_tablas_flota(connection)
+    connection.close()
+except Exception as error:
+    st.error("No se pudo preparar la base de datos para remitos y flota.")
+    st.caption("Verificá que el usuario de Supabase pueda crear las tablas.")
+    registrar_error("preparar tablas de la aplicación", error)
+    st.code(str(error).splitlines()[0])
     st.stop()
 
 if st.session_state.usuario_actual is None:
@@ -1155,19 +1339,7 @@ if st.session_state.get("mostrar_auditoria", False):
     with st.container(border=True):
         mostrar_panel_auditoria()
 
-try:
-    connection = obtener_conexion()
-    preparar_tabla_remitos(connection)
-    preparar_tablas_flota(connection)
-    connection.close()
-except Exception as error:
-    st.error("No se pudo preparar la base de datos para remitos.")
-    st.caption("Verificá que el usuario de Supabase pueda crear las tablas.")
-    registrar_error("preparar tablas de la aplicación", error)
-    st.code(str(error).splitlines()[0])
-    st.stop()
-
-pestanas = ["📥 Remitos", "🚛 Flota", "📊 Reportes", "📷 Escáner IA"]
+pestanas = ["📥 Remitos", "🚛 Flota", "📊 Reportes", "🧾 Facturación", "📷 Escáner IA"]
 es_admin_supremo = st.session_state.usuario_actual == ADMIN_USER
 if es_admin_supremo:
     pestanas.append("👥 Aprobar Usuarios")
@@ -1185,21 +1357,22 @@ with tabs[0]:
         st.code(str(error).splitlines()[0])
         remitos = pd.DataFrame()
 
-    opciones = {"Nuevo remito": None}
     if not remitos.empty:
-        opciones.update(
-            {
-                f"Remito #{row.numero_remito} | {row.fecha} | {row.chofer} | {row.material}": row.id
-                for row in remitos.itertuples()
-            }
-        )
-    seleccion = st.selectbox("Seleccionar remito para editar", list(opciones))
-    seleccionado_id = opciones[seleccion]
-    seleccionado = (
-        remitos.loc[remitos["id"] == seleccionado_id].iloc[0]
-        if seleccionado_id is not None
-        else None
-    )
+        st.caption("Elegí un remito para editar.")
+        for _, fila in remitos.head(25).iterrows():
+            col_info, col_accion = st.columns([6, 2])
+            with col_info:
+                st.write(f"#{int(fila['numero_remito'])} · {fila['fecha']} · {fila['chofer']} · {fila['material']}")
+            with col_accion:
+                if st.button("Editar remito", key=f"btn_edit_remito_{int(fila['id'])}", use_container_width=True):
+                    st.session_state.remito_seleccionado_id = int(fila['id'])
+                    st.rerun()
+        seleccionado_id = st.session_state.get("remito_seleccionado_id")
+        if seleccionado_id is None:
+            seleccionado_id = int(remitos.iloc[0]["id"])
+        seleccionado = remitos.loc[remitos["id"] == int(seleccionado_id)].iloc[0]
+    else:
+        seleccionado = None
     formulario_remito(seleccionado)
 
     st.divider()
@@ -1310,11 +1483,113 @@ with tabs[2]:
     st.info("Los reportes se construirán sobre la lista de remitos cargados.")
 
 with tabs[3]:
+    st.header("🧾 Facturación")
+    st.caption("Agrupá los remitos por cantera y factura para saber qué factura agrupa cada servicio.")
+
+    canteras = cargar_canteras()
+    if canteras.empty:
+        st.info("Todavía no hay canteras cargadas. Agregá una para empezar a facturar.")
+    else:
+        cantera_actual = st.session_state.get("cantera_facturacion", int(canteras.iloc[0]["id"]))
+        nombre_cantera_actual = canteras.loc[canteras["id"] == int(cantera_actual), "nombre"].iloc[0]
+        cantera_seleccionada = st.selectbox(
+            "Cantera",
+            canteras["nombre"].tolist(),
+            index=canteras["nombre"].tolist().index(nombre_cantera_actual),
+        )
+        cantera_id = int(canteras.loc[canteras["nombre"] == cantera_seleccionada, "id"].iloc[0])
+        st.session_state.cantera_facturacion = cantera_id
+
+    with st.form("form_nueva_cantera"):
+        nombre_nueva_cantera = st.text_input("Agregar cantera")
+        if st.form_submit_button("Guardar cantera", type="primary"):
+            if nombre_nueva_cantera.strip():
+                try:
+                    guardar_cantera(nombre_nueva_cantera)
+                    st.success("Cantera guardada.")
+                    st.rerun()
+                except Exception as error:
+                    mostrar_error("guardar la cantera", error)
+
+    if not canteras.empty:
+        st.subheader("Facturas de la cantera")
+        remitos_cantera = obtener_remitos_facturacion(cantera_seleccionada)
+        facturas = obtener_facturas_por_cantera(cantera_id)
+
+        with st.form("form_nueva_factura"):
+            col_nom, col_fecha, col_guardar = st.columns([3, 2, 1.5])
+            with col_nom:
+                nombre_factura = st.text_input("Nombre de factura", key="nombre_factura")
+            with col_fecha:
+                fecha_factura = st.date_input("Fecha", value=date.today(), key="fecha_factura")
+            with col_guardar:
+                st.write("")
+                st.write("")
+                guardar_factura = st.form_submit_button("Agregar factura", type="primary")
+            if not remitos_cantera.empty:
+                remitos_seleccionados = st.multiselect(
+                    "Remitos a incluir",
+                    options=[f"#{int(fila['numero_remito'])} · {fila['fecha']} · {fila['material']} · ${float(fila['subtotal']):,.2f}" for _, fila in remitos_cantera.iterrows()],
+                    default=[],
+                    key="remitos_factura",
+                )
+            else:
+                st.info("No hay remitos cargados para esta cantera todavía.")
+
+        if guardar_factura:
+            if nombre_factura.strip() and remitos_cantera.empty == False:
+                ids = []
+                for texto in remitos_seleccionados:
+                    numero = texto.split("#", 1)[1].split(" · ", 1)[0]
+                    remito = remitos_cantera.loc[remitos_cantera["numero_remito"].astype(str) == str(numero)].iloc[0]
+                    ids.append(int(remito["id"]))
+                try:
+                    crear_factura(cantera_id, nombre_factura, fecha_factura, ids)
+                    st.success("Factura creada.")
+                    st.rerun()
+                except Exception as error:
+                    mostrar_error("crear la factura", error)
+            else:
+                st.warning("Asigná un nombre y al menos un remito para crear la factura.")
+
+        if facturas.empty:
+            st.info("Todavía no hay facturas creadas para esta cantera.")
+        else:
+            for _, factura in facturas.iterrows():
+                with st.expander(f"{factura['nombre']} · {factura['fecha']} · {int(factura['remitos'])} remitos"):
+                    st.write(f"Total estimado: ${float(factura['total']):,.2f}")
+                    conexion = obtener_conexion()
+                    try:
+                        remitos_factura = pd.read_sql_query(
+                            """
+                            SELECT r.numero_remito, r.fecha, r.chofer, r.material, r.subtotal
+                            FROM factura_remitos fr
+                            JOIN remitos_app r ON r.id = fr.remito_id
+                            WHERE fr.factura_id = %s
+                            ORDER BY r.fecha DESC, r.id DESC
+                            """,
+                            conexion,
+                            params=(int(factura["id"]),),
+                        )
+                    finally:
+                        conexion.close()
+                    if remitos_factura.empty:
+                        st.caption("Sin remitos asociados.")
+                    else:
+                        st.dataframe(remitos_factura.rename(columns={
+                            "numero_remito": "N° Remito",
+                            "fecha": "Fecha",
+                            "chofer": "Chofer",
+                            "material": "Material",
+                            "subtotal": "Subtotal",
+                        }), use_container_width=True, hide_index=True)
+
+with tabs[4]:
     st.header("Escáner IA")
     st.info("Aquí se incorporará la lectura de remitos mediante fotografía.")
 
 if es_admin_supremo:
-    with tabs[4]:
+    with tabs[5]:
         st.header("👥 Solicitudes pendientes")
         try:
             connection = obtener_conexion()
