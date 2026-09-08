@@ -12,9 +12,8 @@ import streamlit as st
 ADMIN_USER = "OcampoElio"
 
 
-@st.cache_resource(ttl=1800)
 def obtener_conexion():
-    """Abre PostgreSQL usando únicamente secrets de Streamlit."""
+    """Abre una conexión PostgreSQL fresca por cada uso para evitar conexiones cerradas en re-renders."""
     config = st.secrets["database"] if "database" in st.secrets else st.secrets
     required = ("host", "database", "user", "password", "port")
     missing = [key for key in required if not config.get(key)]
