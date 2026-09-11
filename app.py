@@ -1540,40 +1540,40 @@ with tabs[0]:
         with filtros_col_1:
             fechas = pd.to_datetime(remitos["fecha"], errors="coerce")
             anios = ["Todos"] + sorted(fechas.dt.year.dropna().astype(int).unique().tolist(), reverse=True)
-            st.session_state.filtro_remito_anio = st.selectbox("Año", anios, index=0, key="filtro_remito_anio")
+            st.selectbox("Año", anios, index=0, key="filtro_remito_anio")
         with filtros_col_2:
             meses = ["Todos"] + list(pd.date_range("2000-01-01", periods=12, freq="MS").strftime("%B"))
-            st.session_state.filtro_remito_mes = st.selectbox("Mes", meses, index=0, key="filtro_remito_mes")
+            st.selectbox("Mes", meses, index=0, key="filtro_remito_mes")
         with filtros_col_3:
-            st.session_state.filtro_remito_cantera = st.selectbox(
+            st.selectbox(
                 "Cantera",
                 construir_opciones_filtro(remitos["cantera"]),
                 index=0,
                 key="filtro_remito_cantera",
             )
         with filtros_col_4:
-            st.session_state.filtro_remito_material = st.selectbox(
+            st.selectbox(
                 "Material",
                 construir_opciones_filtro(remitos["material"]),
                 index=0,
                 key="filtro_remito_material",
             )
         with filtros_col_5:
-            st.session_state.filtro_remito_chofer = st.selectbox(
+            st.selectbox(
                 "Chofer",
                 construir_opciones_filtro(remitos["chofer"]),
                 index=0,
                 key="filtro_remito_chofer",
             )
         with filtros_col_6:
-            st.session_state.filtro_remito_patente = st.selectbox(
+            st.selectbox(
                 "Patente",
                 construir_opciones_filtro(remitos["batea"]),
                 index=0,
                 key="filtro_remito_patente",
             )
         with filtros_col_7:
-            st.session_state.filtro_remito_camion = st.selectbox(
+            st.selectbox(
                 "Camión",
                 construir_opciones_filtro(remitos["camion"]),
                 index=0,
