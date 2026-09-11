@@ -1,5 +1,4 @@
-# -*- coding: utf-8 -*-
-from datetime import date
+import datetime
 from decimal import Decimal, InvalidOperation
 import hashlib
 import hmac
@@ -14,7 +13,7 @@ ADMIN_USER = "OcampoElio"
 
 def obtener_conexion():
     """Abre una conexión PostgreSQL fresca por cada uso para evitar conexiones cerradas en re-renders."""
-    config = st.secrets["database"] if "database" in st.secrets else st.secrets
+    config = st.secrets.get("database", st.secrets)
     required = ("host", "database", "user", "password", "port")
     missing = [key for key in required if not config.get(key)]
     if missing:
@@ -177,9 +176,14 @@ def preparar_tablas_flota(connection):
             );
             """
         )
-        
+
         cursor.execute(
             """
+            CREATE TABLE IF NOT EXISTS materiales (
+                id BIGSERIAL PRIMARY KEY,
+                nombre VARCHAR(200) NOT NULL UNIQUE,
+                creado_en TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
             CREATE TABLE IF NOT EXISTS canteras (
                 id BIGSERIAL PRIMARY KEY,
                 nombre VARCHAR(200) NOT NULL UNIQUE,
@@ -401,6 +405,18 @@ def cargar_canteras():
         connection.close()
 
 
+@st.cache_data(ttl=30)
+def cargar_materiales():
+    connection = obtener_conexion()
+    try:
+        return pd.read_sql_query(
+            "SELECT id, nombre FROM materiales ORDER BY nombre",
+            connection,
+        )
+    finally:
+        connection.close()
+
+
 def guardar_cantera(nombre):
     nombre_limpio = (nombre or "").strip()
     if not nombre_limpio:
@@ -415,6 +431,24 @@ def guardar_cantera(nombre):
         connection.commit()
     finally:
         connection.close()
+    st.cache_data.clear()
+
+
+def guardar_material(nombre):
+    nombre_limpio = (nombre or "").strip()
+    if not nombre_limpio:
+        raise ValueError("El material no puede estar vacío.")
+    connection = obtener_conexion()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "INSERT INTO materiales (nombre) VALUES (%s) ON CONFLICT (nombre) DO NOTHING",
+                (nombre_limpio,),
+            )
+        connection.commit()
+    finally:
+        connection.close()
+    st.cache_data.clear()
 
 
 @st.cache_data(ttl=30)
@@ -477,20 +511,85 @@ def crear_factura(cantera_id, nombre, fecha, remitos_ids):
         connection.close()
 
 
-def campo_con_memoria(label, opciones, valor_actual, key):
-    opciones = sorted(set(opciones) | ({str(valor_actual)} if valor_actual else set()))
-    selector_opciones = ["Escribir nuevo..."] + opciones
-    seleccion = st.selectbox(
-        f"{label} (elegir existente)",
-        selector_opciones,
-        index=selector_opciones.index(str(valor_actual))
-        if valor_actual and str(valor_actual) in selector_opciones
-        else 0,
-        key=f"seleccionar_{key}",
+def selector_catalogo(label, opciones, valor_actual, key, incluir_todos=False):
+    valores = [str(item).strip() for item in (opciones or []) if str(item).strip()]
+    if valor_actual and str(valor_actual).strip() and str(valor_actual).strip() not in valores:
+        valores.insert(0, str(valor_actual).strip())
+    opciones_finales = ["Todos"] + valores if incluir_todos else valores
+    if not opciones_finales:
+        return ""
+    valor_base = str(valor_actual).strip() if valor_actual else ""
+    indice = opciones_finales.index(valor_base) if valor_base in opciones_finales else 0
+    return st.selectbox(label, opciones_finales, index=indice, key=key)
+
+
+def fecha_hoy():
+    return datetime.datetime.now(datetime.timezone.utc).date()
+
+
+def render_campo_catalogo(label, opciones, valor_actual="", key_prefix="catalogo", permitir_nuevo=True):
+    valores = [str(item).strip() for item in (opciones or []) if str(item).strip()]
+    valor_actual = str(valor_actual).strip() if valor_actual else ""
+    if valor_actual and valor_actual not in valores:
+        valores.insert(0, valor_actual)
+    opciones_visibles = (["Nuevo..."] + valores) if permitir_nuevo else valores
+    if not opciones_visibles:
+        return ""
+    indice = (
+        valores.index(valor_actual) + 1
+        if permitir_nuevo and valor_actual and valor_actual in valores
+        else 0
     )
-    if seleccion == "Escribir nuevo...":
-        return st.text_input(label, value=str(valor_actual or ""), key=key).strip()
-    return seleccion
+    seleccionado = st.selectbox(label, opciones_visibles, index=indice, key=f"{key_prefix}_select")
+    if permitir_nuevo and seleccionado == "Nuevo...":
+        valor_nuevo = st.text_input(f"{label} (nuevo)", key=f"{key_prefix}_nuevo")
+        return (valor_nuevo or "").strip()
+    return str(seleccionado).strip()
+
+
+def construir_opciones_filtro(series):
+    valores = sorted(
+        {str(valor).strip() for valor in series.dropna() if str(valor).strip()},
+        key=lambda item: item.lower(),
+    )
+    return ["Todos"] + valores
+
+
+def aplicar_filtros_remitos(remitos, filtros):
+    if remitos.empty:
+        return remitos.copy()
+
+    vista = remitos.copy()
+    vista["fecha"] = pd.to_datetime(vista["fecha"], errors="coerce")
+    vista = vista[vista["fecha"].notna()]
+
+    if filtros.get("anio") and filtros["anio"] != "Todos":
+        vista = vista[vista["fecha"].dt.year.astype(str) == str(filtros["anio"])]
+
+    if filtros.get("mes") and filtros["mes"] != "Todos":
+        mes_numero = list(pd.date_range("2000-01-01", periods=12, freq="MS")).index(
+            pd.Timestamp(year=2000, month=list(pd.date_range("2000-01-01", periods=12, freq="MS")).index(
+                pd.Timestamp(year=2000, month=1)
+            ) + 1, day=1)
+        )
+        nombre_mes = filtros["mes"]
+        for idx, nombre in enumerate(pd.date_range("2000-01-01", periods=12, freq="MS").strftime("%B"), start=1):
+            if nombre == nombre_mes:
+                mes_numero = idx
+                break
+        vista = vista[vista["fecha"].dt.month == mes_numero]
+
+    for campo, valor in (
+        ("cantera", filtros.get("cantera")),
+        ("material", filtros.get("material")),
+        ("chofer", filtros.get("chofer")),
+        ("batea", filtros.get("patente")),
+        ("camion", filtros.get("camion")),
+    ):
+        if valor and valor != "Todos":
+            vista = vista[vista[campo].astype(str).str.strip() == str(valor).strip()]
+
+    return vista.sort_values(["fecha", "id"], ascending=[False, False]).reset_index(drop=True)
 
 
 def generar_hash_password(password):
@@ -645,7 +744,7 @@ def editar_recursos_flota(tabla, columnas, etiqueta):
 
 def mostrar_cuadro_asignaciones():
     st.subheader("Asignación operativa")
-    st.caption("Elegí qué camión, batea, chofer y destino trabajan juntos.")
+    st.caption("Elegí qué camión, batea, chofer y destino trabajan juntos. Podés eliminar filas completas si ya no hace falta.")
     try:
         camiones = cargar_flota("camiones")
         bateas = cargar_flota("bateas")
@@ -661,29 +760,14 @@ def mostrar_cuadro_asignaciones():
         return
 
     camion_opciones = {"Sin asignar": None}
-    camion_opciones.update(
-        {
-            str(fila.patente): int(fila.id)
-            for fila in camiones.itertuples()
-        }
-    )
+    camion_opciones.update({str(fila.patente): int(fila.id) for fila in camiones.itertuples()})
     batea_opciones = {"Sin asignar": None}
-    batea_opciones.update(
-        {
-            str(fila.patente): int(fila.id)
-            for fila in bateas.itertuples()
-        }
-    )
+    batea_opciones.update({str(fila.patente): int(fila.id) for fila in bateas.itertuples()})
     chofer_opciones = {"Sin asignar": None}
-    chofer_opciones.update(
-        {
-            f"{fila.nombre} {fila.apellido}": int(fila.id)
-            for fila in choferes.itertuples()
-        }
-    )
+    chofer_opciones.update({f"{fila.nombre} {fila.apellido}": int(fila.id) for fila in choferes.itertuples()})
     cantidad_filas = max(len(camiones), len(bateas), len(choferes), 1)
     with st.form("form_asignaciones"):
-        encabezado_camion, encabezado_batea, encabezado_chofer, encabezado_destino = st.columns(4)
+        encabezado_camion, encabezado_batea, encabezado_chofer, encabezado_destino, encabezado_borrar = st.columns(5)
         with encabezado_camion:
             st.caption("Camión")
         with encabezado_batea:
@@ -692,10 +776,17 @@ def mostrar_cuadro_asignaciones():
             st.caption("Chofer")
         with encabezado_destino:
             st.caption("Destino")
+        with encabezado_borrar:
+            st.caption("Quitar")
 
         asignaciones = []
         for indice in range(cantidad_filas):
-            col_camion, col_batea, col_chofer, col_destino = st.columns(4)
+            col_camion, col_batea, col_chofer, col_destino, col_borrar = st.columns(5)
+            with col_borrar:
+                quitar_fila = st.checkbox("Quitar", key=f"asig_quitar_{indice}", value=False)
+            if quitar_fila:
+                asignaciones.append(None)
+                continue
             with col_camion:
                 camion_guardado = (
                     asignaciones_guardadas.iloc[indice]["camion_id"]
@@ -703,8 +794,7 @@ def mostrar_cuadro_asignaciones():
                     else None
                 )
                 camion_index = next(
-                    (pos for pos, valor in enumerate(camion_opciones.values())
-                     if valor == camion_guardado),
+                    (pos for pos, valor in enumerate(camion_opciones.values()) if valor == camion_guardado),
                     0,
                 )
                 camion = st.selectbox(
@@ -721,8 +811,7 @@ def mostrar_cuadro_asignaciones():
                     else None
                 )
                 batea_index = next(
-                    (pos for pos, valor in enumerate(batea_opciones.values())
-                     if valor == batea_guardada),
+                    (pos for pos, valor in enumerate(batea_opciones.values()) if valor == batea_guardada),
                     0,
                 )
                 batea = st.selectbox(
@@ -739,8 +828,7 @@ def mostrar_cuadro_asignaciones():
                     else None
                 )
                 chofer_index = next(
-                    (pos for pos, valor in enumerate(chofer_opciones.values())
-                     if valor == chofer_guardado),
+                    (pos for pos, valor in enumerate(chofer_opciones.values()) if valor == chofer_guardado),
                     0,
                 )
                 chofer = st.selectbox(
@@ -763,8 +851,12 @@ def mostrar_cuadro_asignaciones():
                     label_visibility="collapsed",
                 )
             asignaciones.append(
-                (camion_opciones[camion], batea_opciones[batea],
-                 chofer_opciones[chofer], destino.strip())
+                (
+                    camion_opciones[camion],
+                    batea_opciones[batea],
+                    chofer_opciones[chofer],
+                    destino.strip(),
+                )
             )
         guardar = st.form_submit_button("Guardar asignaciones", type="primary")
 
@@ -773,7 +865,10 @@ def mostrar_cuadro_asignaciones():
             connection = obtener_conexion()
             with connection.cursor() as cursor:
                 cursor.execute("DELETE FROM asignaciones_flota")
-                for camion_id, batea_id, chofer_id, destino in asignaciones:
+                for fila in asignaciones:
+                    if fila is None:
+                        continue
+                    camion_id, batea_id, chofer_id, destino = fila
                     if any([camion_id, batea_id, chofer_id, destino]):
                         cursor.execute(
                             """
@@ -820,14 +915,14 @@ def mostrar_formulario_flota(tipo):
             dni = st.text_input("DNI", value=str(fila_fuente["dni"]) if fila_fuente is not None and pd.notna(fila_fuente["dni"]) else "")
             licencia = st.text_input("Nro. licencia", value=str(fila_fuente["nro_licencia"]) if fila_fuente is not None and pd.notna(fila_fuente["nro_licencia"]) else "")
             estado = st.selectbox("Estado", ["Activo", "Vacaciones", "Licencia"])
-            vencimiento = st.date_input("Vencimiento licencia", value=date.today())
-            preocupacional = st.date_input("Preocupacional", value=date.today())
+            vencimiento = st.date_input("Vencimiento licencia", value=fecha_hoy())
+            preocupacional = st.date_input("Preocupacional", value=fecha_hoy())
             curso = st.date_input(
                 "Curso de manejo",
                 value=(
                     pd.to_datetime(fila_fuente["curso_manejo"], errors="coerce").date()
                     if fila_fuente is not None and pd.notna(fila_fuente["curso_manejo"])
-                    else date.today()
+                    else fecha_hoy()
                 ),
             )
         elif tipo == "Batea":
@@ -846,9 +941,9 @@ def mostrar_formulario_flota(tipo):
             capacidad = st.number_input("Capacidad (toneladas)", min_value=0.0, step=0.001)
             tipo_batea = st.text_input("Tipo", value=str(fila_fuente["tipo"]) if fila_fuente is not None else "")
             marca = st.text_input("Marca", value=str(fila_fuente["marca"]) if fila_fuente is not None else "")
-            vencimiento_seguro = st.date_input("Vencimiento seguro", value=date.today())
+            vencimiento_seguro = st.date_input("Vencimiento seguro", value=fecha_hoy())
             modelo = st.number_input("Modelo (año)", min_value=1900, max_value=2100, value=2026)
-            service = st.date_input("Service", value=date.today())
+            service = st.date_input("Service", value=fecha_hoy())
         else:
             etiquetas = ["Completar manualmente"] + (
                 recursos_existentes["patente"].astype(str).tolist()
@@ -861,19 +956,19 @@ def mostrar_formulario_flota(tipo):
                 ].iloc[0]
                 if fuente != "Completar manualmente" else None
             )
-            itv = st.date_input("ITV", value=date.today())
-            service = st.date_input("Service", value=date.today())
+            itv = st.date_input("ITV", value=fecha_hoy())
+            service = st.date_input("Service", value=fecha_hoy())
             patente = st.text_input("Patente", value=str(fila_fuente["patente"]) if fila_fuente is not None else "")
             marca = st.text_input("Marca", value=str(fila_fuente["marca"]) if fila_fuente is not None else "")
             estado = st.selectbox("Estado", ["Roto", "Funcional", "Pausa"])
             kilometraje = st.number_input("Kilometraje", min_value=0.0, step=1.0)
-            control = st.date_input("Control periódico", value=date.today())
+            control = st.date_input("Control periódico", value=fecha_hoy())
             seguro = st.date_input(
                 "Seguro",
                 value=(
                     pd.to_datetime(fila_fuente["seguro"], errors="coerce").date()
                     if fila_fuente is not None and pd.notna(fila_fuente["seguro"])
-                    else date.today()
+                    else fecha_hoy()
                 ),
             )
 
@@ -961,33 +1056,71 @@ def mostrar_formulario_flota(tipo):
 def formulario_remito(remito=None):
     editando = remito is not None
     identificador = str(remito["id"]) if editando else "nuevo"
-    st.subheader("Editar remito" if editando else "Cargar remito manual")
+    st.subheader("Editar remito" if editando else "Cargar remito")
 
     with st.form(f"form_remito_{identificador}"):
         try:
             choferes = cargar_choferes_activos()
-        except Exception as error:
-            st.error("No se pudieron cargar los choferes activos.")
-            registrar_error("cargar choferes activos", error)
+            canteras = cargar_canteras()["nombre"].astype(str).tolist()
+            materiales = cargar_materiales()["nombre"].astype(str).tolist()
+            camiones = cargar_flota("camiones")["patente"].astype(str).tolist()
+            bateas = cargar_flota("bateas")["patente"].astype(str).tolist()
+            connection = obtener_conexion()
+            asignaciones_chofer = pd.read_sql_query(
+                """
+                SELECT ch.nombre_completo, ch.nombre, ch.apellido,
+                       cam.patente as camion, bat.patente as batea, a.destino
+                FROM choferes ch
+                LEFT JOIN asignaciones_flota a ON a.chofer_id = ch.id
+                LEFT JOIN camiones cam ON cam.id = a.camion_id
+                LEFT JOIN bateas bat ON bat.id = a.batea_id
+                ORDER BY ch.nombre_completo
+                """,
+                connection,
+            )
+            connection.close()
+        except Exception as error:  # noqa: BLE001
+            st.error("No se pudieron cargar los datos del remito.")
+            registrar_error("cargar datos del remito", error)
             st.code(str(error).splitlines()[0])
             return
         if choferes.empty:
             st.warning("Primero cargá un chofer con estado Activo en Flota.")
             return
-        choferes["etiqueta"] = choferes.apply(
-            lambda row: f"{row['nombre']} {row['apellido']}",
-            axis=1,
+
+        chofer_valor = str(remito["chofer"]).strip() if editando else ""
+        chofer = st.text_input(
+            "Chofer",
+            value=chofer_valor,
+            placeholder="Escribí el nombre y se completará con la flota si existe",
+            key=f"remito_chofer_input_{identificador}",
         )
-        opciones_chofer = choferes["etiqueta"].tolist()
-        chofer_actual = str(remito["chofer"]) if editando else ""
-        indice_chofer = next(
-            (
-                index
-                for index, etiqueta in enumerate(opciones_chofer)
-                if etiqueta == chofer_actual
-            ),
-            0,
+
+        asociacion_chofer = pd.DataFrame()
+        if chofer.strip():
+            alias = chofer.strip().lower()
+            asociacion_chofer = asignaciones_chofer[
+                (asignaciones_chofer["nombre_completo"].astype(str).str.strip().str.lower() == alias)
+                | (asignaciones_chofer["nombre"].astype(str).str.strip().str.lower() == alias)
+                | (asignaciones_chofer["apellido"].astype(str).str.strip().str.lower() == alias)
+            ]
+        camion_default = remito.get("camion", "") if editando else (
+            asociacion_chofer["camion"].dropna().astype(str).iloc[0]
+            if not asociacion_chofer.empty and pd.notna(asociacion_chofer["camion"]).any()
+            else ""
         )
+        batea_default = remito.get("batea", "") if editando else (
+            asociacion_chofer["batea"].dropna().astype(str).iloc[0]
+            if not asociacion_chofer.empty and pd.notna(asociacion_chofer["batea"]).any()
+            else ""
+        )
+        cantera_default = remito.get("cantera", "") if editando else (
+            asociacion_chofer["destino"].dropna().astype(str).iloc[0]
+            if not asociacion_chofer.empty and pd.notna(asociacion_chofer["destino"]).any()
+            else ""
+        )
+        if not editando and asociacion_chofer.empty:
+            st.caption("Si el chofer existe en la flota y tiene asignación cargada, se completarán camión, batea y cantera.")
 
         col_numero, col_chofer = st.columns(2)
         with col_numero:
@@ -997,36 +1130,38 @@ def formulario_remito(remito=None):
                 help="Ingresá el número real del remito; puede ser largo y no se genera automáticamente.",
             )
         with col_chofer:
-            chofer = st.selectbox("Chofer", opciones_chofer, index=indice_chofer)
+            st.caption("")
 
         col_fecha, col_cantera = st.columns(2)
         with col_fecha:
             fecha = st.date_input(
                 "Fecha",
-                value=pd.to_datetime(remito["fecha"]).date()
-                if editando
-                else date.today(),
+                value=pd.to_datetime(remito["fecha"]).date() if editando else fecha_hoy(),
             )
         with col_cantera:
-            try:
-                canteras = cargar_opciones_distintas("remitos_app", "cantera")
-                camiones = cargar_opciones_distintas("camiones", "patente")
-                bateas = cargar_opciones_distintas("bateas", "patente")
-            except Exception as error:
-                canteras, camiones, bateas = [], [], []
-                registrar_error("cargar opciones de remito", error)
-            cantera = campo_con_memoria(
-                "Cantera", canteras, remito.get("cantera", "") if editando else "", "remito_cantera"
+            cantera = render_campo_catalogo(
+                "Cantera",
+                canteras,
+                valor_actual=cantera_default if not editando else remito.get("cantera", ""),
+                key_prefix=f"remito_cantera_{identificador}",
             )
+            if not cantera:
+                st.caption("Agregá una cantera desde el botón + de la lista o escribí una nueva.")
 
         col_camion, col_batea = st.columns(2)
         with col_camion:
-            camion = campo_con_memoria(
-                "Camión", camiones, remito.get("camion", "") if editando else "", "remito_camion"
+            camion = render_campo_catalogo(
+                "Camión",
+                camiones,
+                valor_actual=camion_default if not editando else remito.get("camion", ""),
+                key_prefix=f"remito_camion_{identificador}",
             )
         with col_batea:
-            batea = campo_con_memoria(
-                "Batea", bateas, remito.get("batea", "") if editando else "", "remito_batea"
+            batea = render_campo_catalogo(
+                "Batea / Patente",
+                bateas,
+                valor_actual=batea_default if not editando else remito.get("batea", ""),
+                key_prefix=f"remito_batea_{identificador}",
             )
 
         col_toneladas, col_material = st.columns(2)
@@ -1039,9 +1174,14 @@ def formulario_remito(remito=None):
                 format="%.3f",
             )
         with col_material:
-            material = st.text_input(
-                "Material", value=str(remito["material"]) if editando else ""
+            material = render_campo_catalogo(
+                "Material",
+                materiales,
+                valor_actual=remito.get("material", "") if editando else "",
+                key_prefix=f"remito_material_{identificador}",
             )
+            if not material:
+                st.caption("Agregá un material desde el botón + de la lista o escribí uno nuevo.")
 
         col_tarifa, col_subtotal = st.columns(2)
         with col_tarifa:
@@ -1056,10 +1196,7 @@ def formulario_remito(remito=None):
             subtotal = Decimal(str(toneladas)) * Decimal(str(tarifa))
             st.metric("Subtotal (sin IVA)", f"$ {subtotal:,.2f}")
 
-        guardar = st.form_submit_button(
-            "Actualizar remito" if editando else "Guardar remito",
-            type="primary",
-        )
+        guardar = st.form_submit_button("Actualizar remito" if editando else "Guardar remito", type="primary")
 
     if not guardar:
         return
@@ -1073,9 +1210,7 @@ def formulario_remito(remito=None):
     try:
         toneladas_decimal = decimal_positivo(toneladas, "Toneladas")
         tarifa_decimal = decimal_positivo(tarifa, "La tarifa")
-        subtotal_decimal = (toneladas_decimal * tarifa_decimal).quantize(
-            Decimal("0.01")
-        )
+        subtotal_decimal = (toneladas_decimal * tarifa_decimal).quantize(Decimal("0.01"))
         connection = obtener_conexion()
         try:
             with connection.cursor() as cursor:
@@ -1107,7 +1242,7 @@ def formulario_remito(remito=None):
                         cursor,
                         "Editar remito",
                         f"Remito #{numero_remito}",
-                        f"Se actualizaron fecha, chofer, cantera, camión, batea, toneladas, material y tarifa.",
+                        "Se actualizaron fecha, chofer, cantera, camión, batea, toneladas, material y tarifa.",
                     )
                 else:
                     cursor.execute(
@@ -1152,92 +1287,90 @@ def mostrar_login():
     st.subheader("🔒 Sistema de Gestión Logística y Minería")
     tab_login, tab_registro = st.tabs(["🔑 Iniciar Sesión", "📝 Registrarse"])
 
-    with tab_login:
-        with st.form("form_login"):
-            user = st.text_input("Usuario", key="login_user")
-            password = st.text_input("Contraseña", type="password", key="login_pass")
-            if st.form_submit_button("Ingresar", type="primary"):
+    with tab_login, st.form("form_login"):
+        user = st.text_input("Usuario", key="login_user")
+        password = st.text_input("Contraseña", type="password", key="login_pass")
+        if st.form_submit_button("Ingresar", type="primary"):
+            try:
+                connection = obtener_conexion()
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        SELECT rol, estado, password FROM usuarios
+                        WHERE nombre_usuario = %s
+                        """,
+                        (user,),
+                    )
+                    result = cursor.fetchone()
+                connection.close()
+                password_ok, legacy_password = (
+                    verificar_password(password, result[2]) if result else (False, False)
+                )
+                if password_ok and result[1] == "Aprobado":
+                    if legacy_password:
+                        connection = obtener_conexion()
+                        with connection.cursor() as cursor:
+                            cursor.execute(
+                                "UPDATE usuarios SET password = %s WHERE nombre_usuario = %s",
+                                (generar_hash_password(password), user),
+                            )
+                        connection.commit()
+                        connection.close()
+                    st.session_state.usuario_actual = user
+                    st.session_state.rol_usuario = result[0]
+                    st.rerun()
+                elif password_ok and result[1] == "Pendiente":
+                    st.warning("Tu cuenta está pendiente de aprobación.")
+                elif result:
+                    st.error("Tu acceso fue rechazado o deshabilitado.")
+                else:
+                    st.error("Usuario o contraseña incorrectos.")
+            except psycopg2.Error as error:
+                st.error("PostgreSQL rechazó la conexión.")
+                registrar_error("iniciar sesión", error)
+                st.caption(
+                    "Revisá host, base, usuario, contraseña y puerto en Secrets."
+                )
+                st.code(str(error).splitlines()[0])
+            except Exception as error:  # noqa: BLE001
+                st.error("No se pudo iniciar sesión.")
+                registrar_error("iniciar sesión", error)
+                st.caption(f"Detalle técnico: {error}")
+
+    with tab_registro, st.form("form_registro"):
+        nuevo_user = st.text_input("Elegí un nombre de usuario", key="reg_user")
+        nueva_pass = st.text_input(
+            "Elegí una contraseña", type="password", key="reg_pass"
+        )
+        if st.form_submit_button("Solicitar acceso"):
+            if not nuevo_user.strip() or not nueva_pass:
+                st.warning("Completá todos los campos.")
+            else:
                 try:
                     connection = obtener_conexion()
                     with connection.cursor() as cursor:
                         cursor.execute(
-                            """
-                            SELECT rol, estado, password FROM usuarios
-                            WHERE nombre_usuario = %s
-                            """,
-                            (user,),
+                            "SELECT 1 FROM usuarios WHERE nombre_usuario = %s",
+                            (nuevo_user.strip(),),
                         )
-                        result = cursor.fetchone()
-                    connection.close()
-                    password_ok, legacy_password = (
-                        verificar_password(password, result[2]) if result else (False, False)
-                    )
-                    if password_ok and result[1] == "Aprobado":
-                        if legacy_password:
-                            connection = obtener_conexion()
-                            with connection.cursor() as cursor:
-                                cursor.execute(
-                                    "UPDATE usuarios SET password = %s WHERE nombre_usuario = %s",
-                                    (generar_hash_password(password), user),
-                                )
-                            connection.commit()
-                            connection.close()
-                        st.session_state.usuario_actual = user
-                        st.session_state.rol_usuario = result[0]
-                        st.rerun()
-                    elif password_ok and result[1] == "Pendiente":
-                        st.warning("Tu cuenta está pendiente de aprobación.")
-                    elif result:
-                        st.error("Tu acceso fue rechazado o deshabilitado.")
-                    else:
-                        st.error("Usuario o contraseña incorrectos.")
-                except psycopg2.Error as error:
-                    st.error("PostgreSQL rechazó la conexión.")
-                    registrar_error("iniciar sesión", error)
-                    st.caption(
-                        "Revisá host, base, usuario, contraseña y puerto en Secrets."
-                    )
-                    st.code(str(error).splitlines()[0])
-                except Exception as error:
-                    st.error("No se pudo iniciar sesión.")
-                    registrar_error("iniciar sesión", error)
-                    st.caption(f"Detalle técnico: {error}")
-
-    with tab_registro:
-        with st.form("form_registro"):
-            nuevo_user = st.text_input("Elegí un nombre de usuario", key="reg_user")
-            nueva_pass = st.text_input(
-                "Elegí una contraseña", type="password", key="reg_pass"
-            )
-            if st.form_submit_button("Solicitar acceso"):
-                if not nuevo_user.strip() or not nueva_pass:
-                    st.warning("Completá todos los campos.")
-                else:
-                    try:
-                        connection = obtener_conexion()
-                        with connection.cursor() as cursor:
+                        if cursor.fetchone():
+                            st.error("El usuario ya existe.")
+                        else:
                             cursor.execute(
-                                "SELECT 1 FROM usuarios WHERE nombre_usuario = %s",
-                                (nuevo_user.strip(),),
+                                """
+                                INSERT INTO usuarios
+                                    (nombre_usuario, password, rol, estado)
+                                VALUES (%s, %s, 'Operador', 'Pendiente')
+                                """,
+                                (nuevo_user.strip(), generar_hash_password(nueva_pass)),
                             )
-                            if cursor.fetchone():
-                                st.error("El usuario ya existe.")
-                            else:
-                                cursor.execute(
-                                    """
-                                    INSERT INTO usuarios
-                                        (nombre_usuario, password, rol, estado)
-                                    VALUES (%s, %s, 'Operador', 'Pendiente')
-                                    """,
-                                    (nuevo_user.strip(), generar_hash_password(nueva_pass)),
-                                )
-                                connection.commit()
-                                st.success(
-                                    "Registro completado. Falta la aprobación del administrador."
-                                )
-                        connection.close()
-                    except Exception:
-                        mostrar_error("registrar el usuario")
+                            connection.commit()
+                            st.success(
+                                "Registro completado. Falta la aprobación del administrador."
+                            )
+                    connection.close()
+                except Exception:  # noqa: BLE001
+                    mostrar_error("registrar el usuario")
 
 
 st.set_page_config(
@@ -1357,19 +1490,28 @@ with tabs[0]:
         remitos = pd.DataFrame()
 
     if not remitos.empty:
-        st.caption("Elegí un remito para editar.")
-        for _, fila in remitos.head(25).iterrows():
-            col_info, col_accion = st.columns([6, 2])
-            with col_info:
-                st.write(f"#{int(fila['numero_remito'])} · {fila['fecha']} · {fila['chofer']} · {fila['material']}")
-            with col_accion:
-                if st.button("Editar remito", key=f"btn_edit_remito_{int(fila['id'])}", use_container_width=True):
-                    st.session_state.remito_seleccionado_id = int(fila['id'])
-                    st.rerun()
+        col_buscar, col_btn = st.columns([3, 1])
+        with col_buscar:
+            numero_buscar = st.text_input("Número de remito a editar", key="remito_buscar_numero", placeholder="Ej: 12345")
+        with col_btn:
+            st.write("")
+            if st.button("Buscar", type="primary", use_container_width=True):
+                valor = str(numero_buscar).strip()
+                if valor.isdigit():
+                    remito_encontrado = remitos.loc[remitos["numero_remito"].astype(str) == valor]
+                    if not remito_encontrado.empty:
+                        st.session_state.remito_seleccionado_id = int(remito_encontrado.iloc[0]["id"])
+                    else:
+                        st.session_state.remito_seleccionado_id = None
+                        st.warning("No existe un remito con ese número.")
+                else:
+                    st.session_state.remito_seleccionado_id = None
+                    st.warning("Ingresá un número válido para buscar un remito.")
         seleccionado_id = st.session_state.get("remito_seleccionado_id")
-        if seleccionado_id is None:
-            seleccionado_id = int(remitos.iloc[0]["id"])
-        seleccionado = remitos.loc[remitos["id"] == int(seleccionado_id)].iloc[0]
+        if seleccionado_id is not None:
+            seleccionado = remitos.loc[remitos["id"] == int(seleccionado_id)].iloc[0]
+        else:
+            seleccionado = None
     else:
         seleccionado = None
     formulario_remito(seleccionado)
@@ -1379,7 +1521,80 @@ with tabs[0]:
     if remitos.empty:
         st.info("Todavía no hay remitos cargados.")
     else:
-        vista = remitos.rename(
+        remitos_filtrados = aplicar_filtros_remitos(
+            remitos,
+            {
+                "anio": st.session_state.get("filtro_remito_anio", "Todos"),
+                "mes": st.session_state.get("filtro_remito_mes", "Todos"),
+                "cantera": st.session_state.get("filtro_remito_cantera", "Todos"),
+                "material": st.session_state.get("filtro_remito_material", "Todos"),
+                "chofer": st.session_state.get("filtro_remito_chofer", "Todos"),
+                "patente": st.session_state.get("filtro_remito_patente", "Todos"),
+                "camion": st.session_state.get("filtro_remito_camion", "Todos"),
+            },
+        )
+        filtros_col_1, filtros_col_2, filtros_col_3, filtros_col_4, filtros_col_5, filtros_col_6, filtros_col_7, filtros_col_8 = st.columns([1.3, 1.3, 1.6, 1.6, 1.8, 1.6, 1.6, 0.5])
+        with filtros_col_1:
+            anios = ["Todos"] + sorted(remitos["fecha"].dt.year.dropna().astype(int).unique().tolist(), reverse=True)
+            st.session_state.filtro_remito_anio = st.selectbox("Año", anios, index=0, key="filtro_remito_anio")
+        with filtros_col_2:
+            meses = ["Todos"] + list(pd.date_range("2000-01-01", periods=12, freq="MS").strftime("%B"))
+            st.session_state.filtro_remito_mes = st.selectbox("Mes", meses, index=0, key="filtro_remito_mes")
+        with filtros_col_3:
+            st.session_state.filtro_remito_cantera = st.selectbox(
+                "Cantera",
+                construir_opciones_filtro(remitos["cantera"]),
+                index=0,
+                key="filtro_remito_cantera",
+            )
+        with filtros_col_4:
+            st.session_state.filtro_remito_material = st.selectbox(
+                "Material",
+                construir_opciones_filtro(remitos["material"]),
+                index=0,
+                key="filtro_remito_material",
+            )
+        with filtros_col_5:
+            st.session_state.filtro_remito_chofer = st.selectbox(
+                "Chofer",
+                construir_opciones_filtro(remitos["chofer"]),
+                index=0,
+                key="filtro_remito_chofer",
+            )
+        with filtros_col_6:
+            st.session_state.filtro_remito_patente = st.selectbox(
+                "Patente",
+                construir_opciones_filtro(remitos["batea"]),
+                index=0,
+                key="filtro_remito_patente",
+            )
+        with filtros_col_7:
+            st.session_state.filtro_remito_camion = st.selectbox(
+                "Camión",
+                construir_opciones_filtro(remitos["camion"]),
+                index=0,
+                key="filtro_remito_camion",
+            )
+        with filtros_col_8, st.popover("+", use_container_width=True):
+            tipo_catalogo = st.selectbox("Agregar", ["Cantera", "Material"], key="catalogo_remito_tipo")
+            nuevo_catalogo = st.text_input("Nombre", key="catalogo_remito_nombre")
+            if st.button("Guardar", key="guardar_catalogo_remito", type="primary"):
+                valor = (nuevo_catalogo or "").strip()
+                if not valor:
+                    st.warning("Ingresá un nombre.")
+                else:
+                    try:
+                        if tipo_catalogo == "Cantera":
+                            guardar_cantera(valor)
+                        else:
+                            guardar_material(valor)
+                        st.success(f"Se guardó {tipo_catalogo.lower()}.")
+                        st.cache_data.clear()
+                        st.rerun()
+                    except Exception as error:  # noqa: BLE001
+                        mostrar_error(f"guardar la {tipo_catalogo.lower()}", error)
+
+        vista = remitos_filtrados.rename(
             columns={
                 "id": "ID",
                 "numero_remito": "N° Remito",
@@ -1395,25 +1610,28 @@ with tabs[0]:
                 "creado_por": "Cargado por",
             }
         )
-        st.dataframe(
-            vista[
-                [
-                    "N° Remito",
-                    "Fecha",
-                    "Chofer",
-                    "Cantera",
-                    "Camión",
-                    "Batea",
-                    "Toneladas",
-                    "Material",
-                    "Tarifa",
-                    "Subtotal",
-                    "Cargado por",
-                ]
-            ],
-            use_container_width=True,
-            hide_index=True,
-        )
+        if remitos_filtrados.empty:
+            st.info("No hay remitos para los filtros seleccionados.")
+        else:
+            st.dataframe(
+                vista[
+                    [
+                        "N° Remito",
+                        "Fecha",
+                        "Chofer",
+                        "Cantera",
+                        "Camión",
+                        "Batea",
+                        "Toneladas",
+                        "Material",
+                        "Tarifa",
+                        "Subtotal",
+                        "Cargado por",
+                    ]
+                ],
+                use_container_width=True,
+                hide_index=True,
+            )
 
 with tabs[1]:
     titulo_col, buscar_col, boton_col = st.columns([7, 1.5, 1.5])
@@ -1501,14 +1719,13 @@ with tabs[3]:
 
     with st.form("form_nueva_cantera"):
         nombre_nueva_cantera = st.text_input("Agregar cantera")
-        if st.form_submit_button("Guardar cantera", type="primary"):
-            if nombre_nueva_cantera.strip():
-                try:
-                    guardar_cantera(nombre_nueva_cantera)
-                    st.success("Cantera guardada.")
-                    st.rerun()
-                except Exception as error:
-                    mostrar_error("guardar la cantera", error)
+        if st.form_submit_button("Guardar cantera", type="primary") and nombre_nueva_cantera.strip():
+            try:
+                guardar_cantera(nombre_nueva_cantera)
+                st.success("Cantera guardada.")
+                st.rerun()
+            except Exception as error:  # noqa: BLE001
+                mostrar_error("guardar la cantera", error)
 
     if not canteras.empty:
         st.subheader("Facturas de la cantera")
@@ -1520,7 +1737,7 @@ with tabs[3]:
             with col_nom:
                 nombre_factura = st.text_input("Nombre de factura", key="nombre_factura")
             with col_fecha:
-                fecha_factura = st.date_input("Fecha", value=date.today(), key="fecha_factura")
+                fecha_factura = st.date_input("Fecha", value=fecha_hoy(), key="fecha_factura")
             with col_guardar:
                 st.write("")
                 st.write("")
