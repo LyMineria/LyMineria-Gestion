@@ -630,7 +630,7 @@ def decimal_positivo(value, nombre):
 def cargar_remitos():
     connection = obtener_conexion()
     try:
-        return pd.read_sql_query(
+        remitos = pd.read_sql_query(
             """
                                  SELECT id, numero_remito, fecha, chofer, cantera, camion, batea,
                                      toneladas, material, tarifa, subtotal,
@@ -640,6 +640,9 @@ def cargar_remitos():
             """,
             connection,
         )
+        if not remitos.empty and "fecha" in remitos.columns:
+            remitos["fecha"] = pd.to_datetime(remitos["fecha"], errors="coerce")
+        return remitos
     finally:
         connection.close()
 
@@ -1535,7 +1538,8 @@ with tabs[0]:
         )
         filtros_col_1, filtros_col_2, filtros_col_3, filtros_col_4, filtros_col_5, filtros_col_6, filtros_col_7, filtros_col_8 = st.columns([1.3, 1.3, 1.6, 1.6, 1.8, 1.6, 1.6, 0.5])
         with filtros_col_1:
-            anios = ["Todos"] + sorted(remitos["fecha"].dt.year.dropna().astype(int).unique().tolist(), reverse=True)
+            fechas = pd.to_datetime(remitos["fecha"], errors="coerce")
+            anios = ["Todos"] + sorted(fechas.dt.year.dropna().astype(int).unique().tolist(), reverse=True)
             st.session_state.filtro_remito_anio = st.selectbox("Año", anios, index=0, key="filtro_remito_anio")
         with filtros_col_2:
             meses = ["Todos"] + list(pd.date_range("2000-01-01", periods=12, freq="MS").strftime("%B"))
