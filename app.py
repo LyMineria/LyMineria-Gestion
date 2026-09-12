@@ -727,7 +727,12 @@ def cargar_choferes_activos():
     try:
         return pd.read_sql_query(
             """
-            SELECT id, nombre, apellido, estado
+            SELECT
+                id,
+                COALESCE(nombre_completo, TRIM(CONCAT(nombre, ' ', apellido))) AS nombre_completo,
+                nombre,
+                apellido,
+                estado
             FROM choferes
             WHERE estado = 'Activo'
             ORDER BY apellido, nombre
